@@ -211,7 +211,9 @@ RAM sizing: the maze needs **N⁴ bytes** in one contiguous E820 region.
 | 500 | 58 GiB | 65536 |
 
 The boot menu prints how much RAM it found and the resulting MAX N, so you can
-just experiment. Everything above 4 GiB is used transparently (identity-mapped
+just experiment (the menu flow is: **N** (2…MAX N) → **type** (1 = perfect,
+2 = sparse) → for sparse: **how many walls to remove** (0…X, shown on screen);
+ESC steps back). Everything above 4 GiB is used transparently (identity-mapped
 up to 16 TiB — an 8 TB machine is fine; N is additionally capped at 2000).
 Note: without KVM (`-accel kvm`), generation of very large mazes is slow —
 qemu's TCG interpreter executes the DFS ~50-100× slower than real hardware.
@@ -243,10 +245,10 @@ available — 8 TB boxes welcome (16 TiB identity-map cap).
 
 | file | purpose |
 |------|---------|
-| `maze4d.S` | the whole OS + game, GAS AT&T syntax, ~3100 lines |
+| `maze4d.S` | the whole OS + game, GAS AT&T syntax, ~3200 lines |
 | `build.sh` | build → `maze4d.img` (Linux + FreeBSD) |
 | `run.sh` | convenience qemu launcher |
-| `poc/maze4d_poc.c` | tiny portable C proof-of-concept of the same maze algorithms (generation + sparse removal + BFS solvability/shortest-path checks + text walker); build: `cc -O2 -o maze4d_poc poc/maze4d_poc.c` |
+| `poc/maze4d_poc.c` | tiny portable C proof-of-concept of the same maze algorithms (generation + even-N exit staircase + sparse removal + BFS solvability/shortest-path checks + text walker); build: `cc -O2 -o maze4d_poc poc/maze4d_poc.c`, run: `./maze4d_poc N [seed] [rmwalls]` (N ≥ 2) |
 
 ## Implementation notes
 
