@@ -111,7 +111,17 @@ and every panel scrolls with you through big mazes.
 | I / M | rotate active view (pitch, 3D mode) |
 | U / O | zoom in / out (smaller / larger window, both modes) |
 | R | reset all views and zoom |
+| X | **random move** — one uniformly random step among the open directions |
+| H | **optimal move** — one step along the shortest path to the exit |
 | ESC | back to the size menu |
+
+Both X and H perform a real move and count toward your score. H finds the
+next step by depth-first search from the exit to you through the open voxels,
+using the maze bytes themselves as the DFS stack (the same zero-extra-memory
+trick generation uses) — since the maze is perfect, the discovered path is
+*the* unique shortest path. Holding H therefore auto-solves the maze; on huge
+mazes under TCG emulation one press can take a moment (it may explore the
+whole volume).
 
 ## Building
 

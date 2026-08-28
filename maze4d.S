@@ -1254,7 +1254,7 @@ game_key:
 62: movl %eax,w2win(%rip)
     jmp game_redraw
 7:  cmpb $0x13,%al             /* R: reset views */
-    jne game_key
+    jne 8f
     movl defwinN(%rip),%eax
     movl %eax,vwin(%rip)
     movl %eax,vwin+4(%rip)
@@ -1271,6 +1271,14 @@ game_key:
     movb $242,vpit+2(%rip)
     movb $242,vpit+3(%rip)
     jmp game_redraw
+8:  cmpb $0x2D,%al             /* X: random move */
+    je rnd_move
+    cmpb $0x23,%al             /* H: optimal next step */
+    jne game_key
+    call find_opt
+    testl %eax,%eax
+    js game_redraw
+    movl %eax,%edi
 domv:
     call try_move
     jmp game_redraw
@@ -1309,6 +1317,155 @@ try_move:                      /* edi = dir 0..7 */
     addq $8,%rsp               /* drop return: we won */
     jmp win_scr
 tm_no:
+    ret
+
+/* random move: pick uniformly among the open neighbor voxels */
+rnd_move:
+    leaq pcoord(%rip),%rsi
+    call vox_addr_v
+    movq %rax,%rbp             /* player voxel addr */
+    xorl %ebx,%ebx             /* candidate count */
+    xorl %r13d,%r13d           /* dir */
+rm_c:
+    movl %r13d,%eax
+    shrl $1,%eax               /* axis */
+    movl %r13d,%ecx
+    andl $1,%ecx
+    leaq dsgn1(%rip),%rdx
+    movl (%rdx,%rcx,4),%ecx
+    leaq pcoord(%rip),%rdx
+    addl (%rdx,%rax,4),%ecx
+    cmpl N(%rip),%ecx          /* unsigned: catches -1 too */
+    jae rm_s
+    leaq sdtab(%rip),%rdx
+    movq (%rdx,%r13,8),%rdx
+    testb $1,(%rbp,%rdx)       /* wall? */
+    jnz rm_s
+    leaq cand(%rip),%rax
+    movb %r13b,(%rax,%rbx)
+    incl %ebx
+rm_s:
+    incl %r13d
+    cmpl $8,%r13d
+    jb rm_c
+    testl %ebx,%ebx
+    jz game_redraw
+    movl %ebx,%edi
+    call rng_below
+    leaq cand(%rip),%rcx
+    movzbl (%rcx,%rax),%edi
+    jmp domv
+
+/* optimal next step: DFS from exit to player over open voxels.
+ * The maze is a perfect maze (a tree), so the DFS discovery path is the
+ * unique shortest path.  In-stack voxels hold 0x40|(camefrom<<1) like gen;
+ * dead branches are unmarked while backtracking, and the scan resumes past
+ * the direction just unwound, so nothing is ever revisited (no extra memory,
+ * no cleanup sweep).  Returns eax = dir 0..7 for the player, -1 if none. */
+find_opt:
+    pushq %rbx
+    pushq %rbp
+    pushq %r12
+    pushq %r13
+    pushq %r14
+    pushq %r15
+    movq ecoord(%rip),%rax     /* hvec = exit */
+    movq %rax,hvec(%rip)
+    movq ecoord+8(%rip),%rax
+    movq %rax,hvec+8(%rip)
+    leaq pcoord(%rip),%rsi
+    call vox_addr_v
+    movq %rax,%r15             /* player voxel addr */
+    leaq hvec(%rip),%rsi
+    call vox_addr_v
+    movq %rax,%rbp             /* cur voxel addr */
+    cmpq %r15,%rbp
+    je fo_fail                 /* already at exit */
+    movb $0x50,(%rbp)          /* exit sentinel (bit4) */
+    xorl %r13d,%r13d           /* dir scan index */
+fo_scan:
+    cmpl $8,%r13d
+    jae fo_back
+    movl %r13d,%eax
+    shrl $1,%eax               /* axis */
+    movl %r13d,%ecx
+    andl $1,%ecx
+    leaq dsgn1(%rip),%rdx
+    movl (%rdx,%rcx,4),%ebx    /* delta */
+    leaq hvec(%rip),%rdx
+    movl (%rdx,%rax,4),%ecx
+    addl %ebx,%ecx
+    cmpl N(%rip),%ecx          /* unsigned bounds */
+    jae fo_next
+    leaq sdtab(%rip),%rdx
+    movq (%rdx,%r13,8),%r12
+    cmpb $0,(%rbp,%r12)        /* open and unvisited? */
+    jne fo_next
+    leaq hvec(%rip),%rdx       /* step forward */
+    movl %ecx,(%rdx,%rax,4)
+    addq %r12,%rbp
+    movl %r13d,%ecx            /* mark: came-from = dir^1 */
+    xorl $1,%ecx
+    addl %ecx,%ecx
+    orl $0x40,%ecx
+    movb %cl,(%rbp)
+    cmpq %r15,%rbp
+    je fo_found
+    xorl %r13d,%r13d           /* fresh voxel: scan from 0 */
+    jmp fo_scan
+fo_next:
+    incl %r13d
+    jmp fo_scan
+fo_back:
+    movzbl (%rbp),%eax
+    testb $0x10,%al            /* back at exit: exhausted */
+    jnz fo_fail
+    movb $0,(%rbp)             /* unmark dead branch */
+    shrl $1,%eax
+    andl $7,%eax
+    movl %eax,%r13d            /* d = came-from (cur -> parent) */
+    movl %eax,%ecx
+    andl $1,%ecx
+    leaq dsgn1(%rip),%rdx
+    movl (%rdx,%rcx,4),%ebx
+    movl %r13d,%eax
+    shrl $1,%eax
+    leaq hvec(%rip),%rdx
+    addl %ebx,(%rdx,%rax,4)
+    leaq sdtab(%rip),%rdx
+    movq (%rdx,%r13,8),%r12
+    addq %r12,%rbp             /* cur = parent */
+    movl %r13d,%eax            /* resume past the dir we came down */
+    xorl $1,%eax
+    leal 1(%rax),%r13d
+    jmp fo_scan
+fo_found:
+    movzbl (%rbp),%eax         /* answer = player's came-from dir */
+    shrl $1,%eax
+    andl $7,%eax
+    movl %eax,%r14d
+fo_cl:                         /* unmark the path player -> exit */
+    movzbl (%rbp),%eax
+    movb $0,(%rbp)
+    testb $0x10,%al            /* exit sentinel cleared: done */
+    jnz fo_ret
+    shrl $1,%eax
+    andl $7,%eax
+    leaq sdtab(%rip),%rdx
+    movq (%rdx,%rax,8),%rax
+    addq %rax,%rbp
+    jmp fo_cl
+fo_fail:
+    movb $0,(%rbp)
+    movl $-1,%r14d
+fo_ret:
+    movl %r14d,%eax
+    popq %r15
+    popq %r14
+    popq %r13
+    popq %r12
+    popq %rbp
+    popq %rbx
     ret
 
 win_scr:
@@ -2387,7 +2544,7 @@ s_cur:  .asciz "> "
 s_epos: .asciz "ENTER A POSITIVE NUMBER"
 s_goal: .asciz "GOAL: FROM 1,1,1,1 TO GREEN EXIT"
 s_l1:   .asciz "DOTS:OPEN YEL:YOU GRN:EXIT BLU:START"
-s_l2:   .asciz "ARROWS:XY W/S:Z A/K:W(4D) ESC:MENU"
+s_l2:   .asciz "ARROWS:XY W/S:Z A/K:W(4D) ESC:MENU X:RND H:OPT"
 s_l3:   .asciz "TAB:2D/3D 1-4:VIEW J/L I/M:ROT U/O:ZOOM R:RST"
 s_gen:  .asciz "GENERATING 4D MAZE, N="
 s_hmov: .asciz "MOVES:"
@@ -2495,6 +2652,7 @@ rngs:    .long 0x12345
 pcoord:  .long 0,0,0,0
 ecoord:  .long 0,0,0,0
 tvec:    .long 0,0,0,0
+hvec:    .long 0,0,0,0
 gcur:    .long 0,0,0,0
 svec:    .long 1,1,1,1
 vwin:    .long 15,15,15,15
