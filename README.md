@@ -159,22 +159,32 @@ and every panel scrolls with you through big mazes.
 X, H and B all perform a real move and count toward your score.
 
 **H (hint)** finds its step by a deterministic depth-first search from the
-exit to you through the open voxels, storing the came-from direction in the
-maze bytes themselves (the same zero-extra-memory trick generation uses) and
-sweeping the marks afterwards. Because the search is deterministic it always
-walks the same DFS spanning tree rooted at the exit, and each press moves you
-one step *up* that tree — so repeatedly pressing H **always converges** to
-the exit, from anywhere, even after you wander off. On a **perfect** maze the
-tree path is *the* unique path, so H is optimal there; on a **sparse** maze it
-is a valid route but possibly far from the shortest one.
+exit through the open voxels, storing the came-from direction in the maze
+bytes themselves (the same zero-extra-memory trick generation uses). Because
+the search is deterministic it always builds the same DFS spanning tree
+rooted at the exit, and each press moves you one step *up* that tree — so
+repeatedly pressing H **always converges** to the exit, from anywhere, even
+after you wander off. On a **perfect** maze the tree path is *the* unique
+path, so H is optimal there; on a **sparse** maze it is a valid route but
+possibly far from the shortest one.
 
 **B (best)** runs a full breadth-first search from the exit (wave queues live
 in the spare maze-region memory) and steps along a genuine shortest path —
 on any maze type, from any position. If the region has no spare room for the
 BFS queues, B transparently falls back to H's DFS. On a fully-opened sparse
 maze B walks the straight Manhattan route (e.g. N=5: exactly 16 moves).
-Holding H or B auto-solves the maze; on huge mazes under TCG emulation one
-press can take a moment (it may explore the whole volume).
+
+Both searches map the **whole volume once per maze and cache the result**:
+the exit-rooted came-from tree stays right in the voxel mark bits (movement
+and rendering only ever test the wall bit), so only the *first* H or B press
+after generating a maze pays for the search — big volumes take a while under
+TCG, and that first press shows a progress-bar overlay ("MAPPING ROUTES TO
+THE EXIT...") mid-screen. Every following press answers instantly by reading
+your voxel's cached mark, which makes holding H or B a smooth auto-solve.
+B's BFS marks form a true shortest-path tree, so after one B press H answers
+optimally too; pressing B when only H's DFS tree is cached rebuilds the marks
+(one more search) since the DFS tree may be sub-optimal. Regenerating a maze
+invalidates the cache.
 
 ## Building
 
@@ -247,7 +257,7 @@ available — 8 TB boxes welcome (16 TiB identity-map cap).
 
 | file | purpose |
 |------|---------|
-| `maze4d.S` | the whole OS + game, GAS AT&T syntax, ~3200 lines |
+| `maze4d.S` | the whole OS + game, GAS AT&T syntax, ~3300 lines |
 | `build.sh` | build → `maze4d.img` (Linux + FreeBSD) |
 | `run.sh` | convenience qemu launcher |
 | `poc/maze4d_poc.c` | tiny portable C proof-of-concept of the same maze algorithms (generation + even-N exit staircase + sparse removal + BFS solvability/shortest-path checks + text walker); build: `cc -O2 -o maze4d_poc poc/maze4d_poc.c`, run: `./maze4d_poc N [seed] [rmwalls]` (N ≥ 2) |

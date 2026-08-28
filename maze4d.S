@@ -35,9 +35,13 @@
  * MAZE REPRESENTATION
  * ----------------------------------------------------------------------
  *   N^4 voxels, one byte each, index = x + N*y + N^2*z + N^3*w.
- *   bit0 = 1 wall, bit0 = 0 open.  Upper bits are TEMPORARY search /
- *   generator marks: 0x40|(came_from_dir<<1) visited, bit4 = root
- *   sentinel; sweep_marks() clears everything but bit0 afterwards.
+ *   bit0 = 1 wall, bit0 = 0 open.  Upper bits are search / generator
+ *   marks: 0x40|(came_from_dir<<1) visited, bit4 = root sentinel.  The
+ *   generator wipes its own marks while backtracking; the H/B search
+ *   marks form an exit-rooted tree that is CACHED in place (renderer
+ *   and movement only ever test bit0) until the next maze is built -
+ *   sweep_marks() clears everything but bit0 when a stale tree has to
+ *   be replaced.
  *
  *   "Rooms" live at all-EVEN coordinates 0..maxc (m = ceil(N/2) rooms
  *   per axis, maxc = 2m-2); the voxels between adjacent rooms are the
@@ -67,17 +71,23 @@
  *              turning the maze into a braided/looped one, up to a
  *              completely open N^4 box at R = X.
  *   find_opt   H key "hint": deterministic DFS from the exit that keeps
- *              its visited marks for the whole search, i.e. it walks a
+ *              its visited marks for the whole search, i.e. it builds a
  *              FIXED spanning tree rooted at the exit.  Every press
  *              moves the player one step up that tree, so the distance
  *              to the exit strictly decreases - guaranteed convergence
  *              even on looped sparse mazes (where the route may be
  *              sub-optimal).  On a perfect maze the tree path IS the
- *              unique (optimal) route.
+ *              unique (optimal) route.  The tree is built ONCE per maze
+ *              (with a progress-bar overlay - mapping a big volume takes
+ *              a while) and cached in the voxel marks: every later press
+ *              just reads the player's mark (optok flag).
  *   find_best  B key "best": true shortest next step - breadth-first
  *              search from the exit using wave buffers in the maze
  *              region's slack memory; falls back to find_opt if the
- *              slack cannot hold a wave.  Marks are wiped afterwards.
+ *              slack cannot hold a wave.  Also one-off with a progress
+ *              bar: its marks form a shortest-path tree over the whole
+ *              volume, cached for both B and H (bestok + optok flags)
+ *              until the maze is regenerated.
  *   rng        xorshift32, seeded from the TSC at boot.
  *
  * ----------------------------------------------------------------------
@@ -1260,6 +1270,8 @@ gen_maze:
     pushq %r13
     pushq %r14
     pushq %r15
+    movl $0,optok(%rip)        /* new maze: cached search trees invalid */
+    movl $0,bestok(%rip)
     call clear_fb
     movl $16,curx(%rip)
     movl $16,cury(%rip)
@@ -1422,6 +1434,14 @@ gst_l:
     cmpl $4,%r13d
     jb gst_l
 gnost:
+    movq cells(%rip),%rax      /* open voxels so far: m^4 rooms plus   */
+    leaq -1(%rax,%rax),%rax    /* m^4-1 carved walls ...               */
+    movl maxc(%rip),%ecx
+    incl %ecx
+    cmpl N(%rip),%ecx
+    je 5f
+    addq $4,%rax               /* ... + 4 staircase voxels for even N  */
+5:  movq %rax,freevox(%rip)    /* denominator for the search bars      */
     movq rmwalls(%rip),%r14    /* sparse: remove R random walls */
     testq %r14,%r14
     jz grt
@@ -1450,7 +1470,8 @@ gnost:
     cmpq %r15,%r14             /* safety clamp: need <= rem */
     jbe 1f
     movq %r15,%r14
-1:  movq mazeb(%rip),%rbx
+1:  addq %r14,freevox(%rip)    /* removal opens exactly `need` voxels */
+    movq mazeb(%rip),%rbx
     movq total(%rip),%rbp
 rml:
     cmpb $1,(%rbx)             /* still a wall? */
@@ -1714,34 +1735,75 @@ rm_s:
     movzbl (%rcx,%rax),%edi
     jmp domv
 
-/* assisted move: DFS from exit to player over open voxels.
- * Visited voxels keep 0x40|(camefrom<<1) permanently during the search, so
- * each voxel is entered at most once and the run time is linear even when
- * the maze has cycles (sparse mazes).  The came-from chain of the first
- * discovery is a simple path to the exit: on a perfect maze it is THE unique
- * (shortest) path; on a sparse maze it is a valid, converging (depth in the
- * fixed DFS spanning tree strictly decreases every press) but possibly
- * sub-optimal path.  All marks are wiped by sweep_marks before returning.
+/* in-game progress overlay for the one-off find_opt / find_best searches:
+ * a fresh copy of the generation bar (border + background) mid-screen, a
+ * backed status line under it, search counter svis reset.  The overlay is
+ * wiped by the game_redraw that always follows the search. */
+srch_init:
+    movl barx(%rip),%edi
+    subl $2,%edi
+    movl bary(%rip),%esi
+    subl $2,%esi
+    movl barw(%rip),%edx
+    addl $4,%edx
+    movl barh(%rip),%ecx
+    addl $4,%ecx
+    movl $ID_BORD,%r8d
+    call fill_rect
+    movl barx(%rip),%edi
+    movl bary(%rip),%esi
+    movl barw(%rip),%edx
+    movl barh(%rip),%ecx
+    movl $ID_BG,%r8d
+    call fill_rect
+    movl ts(%rip),%eax         /* backing rect for a 30-char status line */
+    imull $240,%eax,%edx
+    movl ts(%rip),%ecx
+    shll $3,%ecx
+    addl $8,%ecx
+    movl $12,%edi
+    movl bary(%rip),%esi
+    addl $16,%esi
+    movl $ID_BG,%r8d
+    call fill_rect
+    movl $16,curx(%rip)
+    movl bary(%rip),%eax
+    addl $20,%eax
+    movl %eax,cury(%rip)
+    movl $ID_TXT,colr(%rip)
+    leaq s_srch(%rip),%rsi
+    call draw_str
+    movq $0,svis(%rip)
+    ret
+
+/* assisted move: DFS from the exit over ALL open voxels.
+ * Visited voxels keep 0x40|(camefrom<<1), so each voxel is entered at most
+ * once and the run time is linear even when the maze has cycles (sparse
+ * mazes).  The marks form a FIXED spanning tree rooted at the exit: the
+ * player's mark is the next hop of a simple path to the exit - on a perfect
+ * maze THE unique (shortest) path; on a sparse maze a valid, converging
+ * (tree depth strictly decreases every press) but possibly sub-optimal one.
+ * The tree is built ONCE per maze - with the progress overlay, since big
+ * volumes take a while - then cached in the voxel bytes (renderer and
+ * movement only test bit0), so every later press answers instantly.
  * Returns eax = dir 0..7 for the player, -1 if unreachable (impossible). */
 find_opt:
+    cmpl $0,optok(%rip)        /* cached tree from an earlier H/B press? */
+    jne mark_dir
     pushq %rbx
     pushq %rbp
     pushq %r12
     pushq %r13
     pushq %r14
     pushq %r15
+    call srch_init             /* progress overlay + svis = 0 */
     movq ecoord(%rip),%rax     /* hvec = exit */
     movq %rax,hvec(%rip)
     movq ecoord+8(%rip),%rax
     movq %rax,hvec+8(%rip)
-    leaq pcoord(%rip),%rsi
-    call vox_addr_v
-    movq %rax,%r15             /* player voxel addr */
     leaq hvec(%rip),%rsi
     call vox_addr_v
     movq %rax,%rbp             /* cur voxel addr */
-    cmpq %r15,%rbp
-    je fo_fail                 /* already at exit */
     movb $0x50,(%rbp)          /* exit sentinel (bit4) */
     xorl %r13d,%r13d           /* dir scan index */
 fo_scan:
@@ -1770,17 +1832,28 @@ fo_scan:
     addl %ecx,%ecx
     orl $0x40,%ecx
     movb %cl,(%rbp)
-    cmpq %r15,%rbp
-    je fo_found
-    xorl %r13d,%r13d           /* fresh voxel: scan from 0 */
+    incq svis(%rip)            /* progress: voxels mapped so far */
+    movq svis(%rip),%rax
+    testl $0x3FFF,%eax
+    jnz 5f
+    movslq barw(%rip),%rcx
+    mulq %rcx
+    divq freevox(%rip)
+    movl %eax,%edx
+    movl barx(%rip),%edi
+    movl bary(%rip),%esi
+    movl barh(%rip),%ecx
+    movl $ID_BAR,%r8d
+    call fill_rect             /* preserves rbp */
+5:  xorl %r13d,%r13d           /* fresh voxel: scan from 0 */
     jmp fo_scan
 fo_next:
     incl %r13d
     jmp fo_scan
 fo_back:
     movzbl (%rbp),%eax
-    testb $0x10,%al            /* back at exit: exhausted */
-    jnz fo_fail
+    testb $0x10,%al            /* back at exit: whole volume mapped */
+    jnz fo_done
     shrl $1,%eax               /* mark stays (visited forever) */
     andl $7,%eax
     movl %eax,%r13d            /* d = came-from (cur -> parent) */
@@ -1799,28 +1872,33 @@ fo_back:
     xorl $1,%eax
     leal 1(%rax),%r13d
     jmp fo_scan
-fo_found:
-    movzbl (%rbp),%eax         /* answer = player's came-from dir */
-    shrl $1,%eax
-    andl $7,%eax
-    movl %eax,%r14d
-    call sweep_marks           /* restore maze to walls/open only */
-    jmp fo_ret
-fo_fail:
-    call sweep_marks
-    movl $-1,%r14d
-fo_ret:
-    movl %r14d,%eax
+fo_done:
+    movl $1,optok(%rip)        /* tree cached for this maze */
     popq %r15
     popq %r14
     popq %r13
     popq %r12
     popq %rbp
     popq %rbx
+    /* fall through */
+
+/* read the player's cached came-from mark: eax = dir 0..7 towards the
+ * exit, -1 if the voxel is unmarked (unreachable - impossible here). */
+mark_dir:
+    leaq pcoord(%rip),%rsi
+    call vox_addr_v
+    movzbl (%rax),%eax
+    testb $0x40,%al
+    jz 1f
+    shrl $1,%eax
+    andl $7,%eax
+    ret
+1:  movl $-1,%eax
     ret
 
-/* clear every non-wall bit in the whole maze volume (removes all search
- * marks left by find_opt / find_best).  8 bytes at a time. */
+/* clear every non-wall bit in the whole maze volume (used when a stale
+ * cached search tree must be replaced, and by the BFS overflow path).
+ * 8 bytes at a time. */
 sweep_marks:
     movq mazeb(%rip),%rdi
     movq total(%rip),%rcx
@@ -1845,11 +1923,15 @@ sweep_marks:
  * The BFS wave queues live in the spare memory of the maze's E820 region
  * (after the N^4 maze bytes): entry = voxel addr (8) + 4 packed u16 coords
  * (8).  Parent directions are stored in the voxel bytes exactly like
- * find_opt, so the player's mark is the next hop of a genuine shortest path.
- * If the spare memory is too small (or a wave overflows it), falls back to
- * find_opt.  All marks are swept before returning.
+ * find_opt, but here they form a genuine shortest-path tree over the WHOLE
+ * volume.  The search runs ONCE per maze (progress overlay, counting
+ * dequeued voxels) and the marks are cached: they then answer both B and H
+ * instantly until the maze is regenerated.  If the spare memory is too
+ * small (or a wave overflows it), falls back to find_opt's DFS tree.
  * Returns eax = dir 0..7, -1 if unreachable (impossible). */
 find_best:
+    cmpl $0,bestok(%rip)       /* cached shortest-path tree? */
+    jne mark_dir
     pushq %rbx
     pushq %rbp
     pushq %r12
@@ -1872,13 +1954,13 @@ find_best:
     movq %rdx,wvcap(%rip)
     addq wvA(%rip),%rdx
     movq %rdx,wvB(%rip)
-    leaq pcoord(%rip),%rsi
-    call vox_addr_v
-    movq %rax,%r15             /* player voxel addr */
+    cmpl $0,optok(%rip)        /* stale DFS tree in the marks? */
+    je 5f
+    call sweep_marks           /* wipe it: BFS needs a clean volume */
+    movl $0,optok(%rip)
+5:  call srch_init             /* progress overlay + svis = 0 */
     leaq ecoord(%rip),%rsi
     call vox_addr_v
-    cmpq %r15,%rax
-    je fb_fail
     movb $0x50,(%rax)          /* exit sentinel */
     movq wvA(%rip),%rdi        /* seed wave = exit */
     movq %rax,(%rdi)
@@ -1895,7 +1977,20 @@ fb_wave:
 fb_ent:
     cmpq wcur(%rip),%r13
     jae fb_wdone
-    movq %r13,%rdx
+    incq svis(%rip)            /* progress: voxels dequeued so far */
+    movq svis(%rip),%rax
+    testl $0x3FFF,%eax
+    jnz 6f
+    movslq barw(%rip),%rcx
+    mulq %rcx
+    divq freevox(%rip)
+    movl %eax,%edx
+    movl barx(%rip),%edi
+    movl bary(%rip),%esi
+    movl barh(%rip),%ecx
+    movl $ID_BAR,%r8d
+    call fill_rect             /* preserves r13 */
+6:  movq %r13,%rdx
     shlq $4,%rdx
     addq wvA(%rip),%rdx
     movq (%rdx),%rbp           /* voxel addr */
@@ -1926,8 +2021,6 @@ fb_dir:
     leal (%rax,%rax),%eax
     orl $0x40,%eax
     movb %al,(%rdi)
-    cmpq %r15,%rdi
-    je fb_found
     movq wnxt(%rip),%rax       /* push to next wave */
     leaq 1(%rax),%rsi
     shlq $4,%rsi
@@ -1955,7 +2048,7 @@ fb_edone:
 fb_wdone:
     movq wnxt(%rip),%rax
     testq %rax,%rax
-    jz fb_fail                 /* frontier died: unreachable */
+    jz fb_done                 /* frontier empty: whole volume mapped */
     movq %rax,wcur(%rip)
     movq $0,wnxt(%rip)
     movq wvA(%rip),%rax        /* swap wave buffers */
@@ -1963,25 +2056,16 @@ fb_wdone:
     movq %rdx,wvA(%rip)
     movq %rax,wvB(%rip)
     jmp fb_wave
-fb_found:
-    movzbl (%rdi),%eax         /* answer = player's came-from dir */
-    shrl $1,%eax
-    andl $7,%eax
-    movl %eax,%r14d
-    call sweep_marks
-    movl %r14d,%eax
-    jmp fb_ret
-fb_fail:
-    call sweep_marks
-    movl $-1,%eax
-fb_ret:
+fb_done:
+    movl $1,optok(%rip)        /* marks = shortest-path tree, cached: */
+    movl $1,bestok(%rip)       /* serves both B and H from now on */
     popq %r15
     popq %r14
     popq %r13
     popq %r12
     popq %rbp
     popq %rbx
-    ret
+    jmp mark_dir
 fb_overflow:
     call sweep_marks           /* wave didn't fit: clean up, use DFS */
 fb_nobuf:
@@ -3078,6 +3162,7 @@ s_wl1:  .asciz "REMOVABLE WALLS: "
 s_wl2:  .asciz "HOW MANY TO REMOVE? (0 - MAX ABOVE, EMPTY = 0)"
 s_wl3:  .asciz "ENTER = GENERATE, ESC = BACK"
 s_rmw:  .asciz "REMOVING RANDOM WALLS..."
+s_srch: .asciz "MAPPING ROUTES TO THE EXIT..."
 s_goal: .asciz "GOAL: FROM 0,0,0,0 TO GREEN EXIT"
 s_l1:   .asciz "DOTS:OPEN YEL:YOU GRN:EXIT BLU:START"
 s_l2:   .asciz "ARROWS:XY W/S:Z A/K:W(4D) ESC:MENU X:RND H:HINT B:BEST"
@@ -3123,6 +3208,8 @@ wvB:     .quad 0
 wvcap:   .quad 0
 wcur:    .quad 0
 wnxt:    .quad 0
+freevox: .quad 0
+svis:    .quad 0
 stride:  .quad 0,0,0,0
 sdtab:   .quad 0,0,0,0,0,0,0,0
 m_pa:    .quad 0
@@ -3222,6 +3309,8 @@ barx:    .long 0
 bary:    .long 0
 barw:    .long 0
 barh:    .long 0
+optok:   .long 0
+bestok:  .long 0
 vyaw:    .byte 21,21,21,21
 vpit:    .byte 242,242,242,242
 m_dsz:   .byte 0,0,0,0
