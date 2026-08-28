@@ -29,9 +29,12 @@ You start at voxel `(1,1,1,1)`; you win by reaching the exit in the far corner
    * enables the A20 gate (`int 15h AX=2401` + port `0x92`),
    * grabs the **E820 memory map** (up to 32 entries stored at `0x5000`),
    * copies the BIOS **8×8 VGA font** to `0x70000` (used later for text),
-   * scans **VESA VBE** modes and picks the best linear-framebuffer mode up to
-     **1920×1200**, preferring 32 bpp, then 24/16/8 bpp; falls back to VGA mode
-     13h (320×200×8) when VBE is absent,
+   * scans **VESA VBE** modes and picks the **highest-resolution** linear-
+     framebuffer mode the hardware offers (no cap — 4K+ welcome; ties broken by
+     color depth). Modes with misreported layouts (5:5:5 posing as 16 bpp,
+     non-XRGB direct color) are rejected; if setting the best mode fails the
+     next-best is tried automatically, and VGA mode 13h (320×200×8) remains
+     the final fallback when VBE is absent,
    * builds a bootstrap 4 GiB identity map (2 MiB pages) at `0x10000`,
    * switches PE→PAE→LME→PG in one shot and jumps straight to 64-bit code.
 3. **64-bit init ("modern unreal mode")** — long mode *requires* paging, so the
@@ -62,8 +65,11 @@ Perfect maze (every cell reachable, exactly one path between any two cells) via
 
 ### Rendering 4D
 
-A 4D maze can't be drawn directly, so the screen shows **four 3D orthographic
-dot-cloud views** in a 2×2 grid — the four 3D "hyperplanes" through the player:
+A 4D maze can't be drawn directly, so the game offers **two switchable
+display modes** (TAB toggles between them).
+
+**3D mode (default)** shows **four 3D orthographic dot-cloud views** in a 2×2
+grid — the four 3D "hyperplanes" through the player:
 
 | view | axes shown | axis held fixed at player's coordinate |
 |------|-----------|------------------------------------------|
@@ -80,7 +86,17 @@ a useful 4D navigation hint. Colored dots near the center show the +x/+y/+z/+w
 axis directions (orange/cyan/violet/white). Each view rotates (yaw/pitch) and
 zooms independently; all transforms are 14-bit fixed-point integer math using
 the x87-generated sine table. Text is drawn with the BIOS 8×8 font scaled to
-the resolution.
+the resolution (legend and view labels use a smaller scale so the views get
+the maximum possible screen area).
+
+**2D mode (TAB)** shows all **six 2D axis-aligned projections** — XY, XZ, XW,
+YZ, YW, ZW — as flat maze slices in a 3×2 grid. Each panel fixes the two
+remaining axes at your current coordinates and draws the resulting 2D slice:
+light cells = open, dark = walls, yellow = you, green = exit, blue = start
+(markers appear only when the two fixed coordinates match, same slice rule as
+3D mode). The visible window auto-fits: the grid is scaled and centered so the
+visible cells always fill the panel. U/O shrinks/grows the window (R resets),
+and every panel scrolls with you through big mazes.
 
 ### Controls
 
@@ -89,11 +105,12 @@ the resolution.
 | arrows | move ±x (left/right), ±y (down/up) |
 | W / S | move +z / −z |
 | A / K | move +w / −w (*ata / kata*) |
-| 1-4 | select active view |
-| J / L | rotate active view (yaw) |
-| I / M | rotate active view (pitch) |
-| U / O | zoom in / out (smaller / larger window) |
-| R | reset all views |
+| TAB | toggle 4×3D views ↔ 6×2D projections |
+| 1-4 | select active view (3D mode) |
+| J / L | rotate active view (yaw, 3D mode) |
+| I / M | rotate active view (pitch, 3D mode) |
+| U / O | zoom in / out (smaller / larger window, both modes) |
+| R | reset all views and zoom |
 | ESC | back to the size menu |
 
 ## Building
@@ -165,7 +182,7 @@ available — 8 TB boxes welcome (16 TiB identity-map cap).
 
 | file | purpose |
 |------|---------|
-| `maze4d.S` | the whole OS + game, GAS AT&T syntax, ~2100 lines |
+| `maze4d.S` | the whole OS + game, GAS AT&T syntax, ~2500 lines |
 | `build.sh` | build → `maze4d.img` (Linux + FreeBSD) |
 | `run.sh` | convenience qemu launcher |
 | `poc/maze4d_poc.c` | tiny portable C proof-of-concept of the same maze algorithm (generation + BFS solvability check + text walker); build: `cc -O2 -o maze4d_poc poc/maze4d_poc.c` |
@@ -180,7 +197,12 @@ available — 8 TB boxes welcome (16 TiB identity-map cap).
   triple-fault and reboot, which doubles as a very honest crash handler.
 * The player moves voxel-by-voxel: cells sit at odd coordinates, carved wall
   voxels between them are walkable too, so crossing cell→cell costs 2 moves.
+* Every drawing primitive clips to the framebuffer, and the layout adapts to
+  the mode geometry (text scale is chosen from both width and height), so any
+  resolution a real VBE BIOS throws at it — 320×200 up to 4K+ — stays playable.
 * Verified end-to-end in qemu: boot → menu → generation → all 8 move
-  directions → per-view rotate/zoom → win screen → menu, at N=5…300,
-  at 1920×1200×32 (stdvga) and 1280×1024×16 (cirrus), with the maze region
-  placed above the 4 GiB boundary (`-m 12288`).
+  directions → per-view rotate/zoom → 2D/3D toggle → win screen → menu, at
+  N=5…300, at 3840×2160×16 and 1920×1200×32 (stdvga), 1600×1200×8 and
+  1152×864×8 (DAC palette path), 1280×1024×16 (cirrus) and 320×200×8
+  (mode 13h), with the maze region placed above the 4 GiB boundary
+  (`-m 12288`).

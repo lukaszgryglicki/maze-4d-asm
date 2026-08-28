@@ -208,6 +208,10 @@ e8d:
     movw VBEI+0x0E,%si         /* mode list far ptr */
     movw VBEI+0x10,%ax
     movw %ax,%fs
+    movl $0,A(bestlim)
+    decl A(bestlim)            /* no upper score limit yet */
+vbe_scan:
+    movw VBEI+0x0E,%si
     movl $0,A(bestsc)
     movw $0,A(bestmd)
     movw $128,A(mcnt)
@@ -238,26 +242,35 @@ vbe_l:
 1:  cmpb $6,%ah                /* direct color */
     jne vbe_n
     cmpb $16,%al
+    jne 5f
+    movb MODEI+0x21,%ah        /* 16bpp: need green=6 (5:6:5) */
+    testb %ah,%ah
+    jz 2f                      /* masks unfilled: trust bpp */
+    cmpb $6,%ah
     je 2f
-    cmpb $24,%al
-    je 2f
+    jmp vbe_n
+5:  cmpb $24,%al
+    je 6f
     cmpb $32,%al
     jne vbe_n
+6:  movb MODEI+0x1F,%ah        /* 24/32bpp: expect red @16 (XRGB) */
+    testb %ah,%ah
+    jz 2f
+    cmpb $16,MODEI+0x20
+    jne vbe_n
 2:  movzwl MODEI+0x12,%eax     /* X */
-    cmpl $640,%eax
+    cmpl $320,%eax
     jb vbe_n
-    cmpl $1920,%eax
-    ja vbe_n
     movzwl MODEI+0x14,%edx     /* Y */
-    cmpl $400,%edx
+    cmpl $200,%edx
     jb vbe_n
-    cmpl $1200,%edx
-    ja vbe_n
     imull %edx,%eax            /* score = area*4 + bytespp */
     shll $2,%eax
     movzbl MODEI+0x19,%edx
     shrl $3,%edx
     orl %edx,%eax
+    cmpl A(bestlim),%eax       /* skip tiers that failed to set */
+    jae vbe_n
     cmpl A(bestsc),%eax
     jbe vbe_n
     movl %eax,A(bestsc)
@@ -274,13 +287,13 @@ vbe_sel:
     movw $MODEI,%di
     int $0x10
     cmpw $0x004F,%ax
-    jne vbe_fb
+    jne vbe_bad
     movw $0x4F02,%ax
     movw A(bestmd),%bx
     orw $0x4000,%bx            /* LFB */
     int $0x10
     cmpw $0x004F,%ax
-    jne vbe_fb
+    jne vbe_bad
     movl MODEI+0x28,%eax
     movl %eax,A(fbphys)
     movzwl MODEI+0x10,%eax
@@ -292,6 +305,10 @@ vbe_sel:
     movzbl MODEI+0x19,%eax
     movl %eax,A(fbbpp)
     jmp vbe_ok
+vbe_bad:
+    movl A(bestsc),%eax        /* exclude this tier, retry next best */
+    movl %eax,A(bestlim)
+    jmp vbe_scan
 vbe_fb:
     movw $0x0013,%ax           /* VGA 320x200x8 fallback */
     int $0x10
@@ -567,14 +584,24 @@ rg_d:
     shrl $3,%eax
     movl %eax,bytespp(%rip)
     movl fbw(%rip),%edx
+    movl fbh(%rip),%esi        /* ts needs width AND height */
     movl $1,%eax
-    cmpl $800,%edx
+    cmpl $1280,%edx
+    jb 1f
+    cmpl $720,%esi
     jb 1f
     movl $2,%eax
-    cmpl $1280,%edx
+    cmpl $2560,%edx
+    jb 1f
+    cmpl $1440,%esi
     jb 1f
     movl $3,%eax
 1:  movl %eax,ts(%rip)
+    movl %eax,%ecx             /* tsl = max(1,ts-1): legend/labels */
+    decl %ecx
+    jnz 4f
+    movl $1,%ecx
+4:  movl %ecx,tsl(%rip)
     movl $8,%eax
     cmpl $640,%edx
     jae 2f
@@ -626,15 +653,16 @@ dacl:
     cmpl $NCOL,%ecx
     jb dacl
 dac_d:
-    /* layout: 2x2 view grid */
-    movl ts(%rip),%eax
+    /* layout: HUD/legend bands; 2x2 3D grid; 3x2 2D grid */
+    movl tsl(%rip),%eax
     imull $10,%eax,%ecx
-    movl %ecx,lab(%rip)
+    movl %ecx,lab(%rip)        /* label band = 10*tsl */
+    imull $30,%eax,%esi
+    addl $6,%esi               /* legh = 30*tsl+6 */
+    movl ts(%rip),%eax
     imull $20,%eax,%edx
     addl $6,%edx
     movl %edx,hudh(%rip)
-    imull $30,%eax,%esi
-    addl $6,%esi               /* legh */
     movl fbh(%rip),%edi
     subl %esi,%edi
     subl %edx,%edi
@@ -674,7 +702,43 @@ dac_d:
     movl %edx,yl1(%rip)
     addl lab(%rip),%edx
     movl %edx,vy1(%rip)
-    movl ts(%rip),%eax
+    /* 2D grid: s2side = min((fbw-4gap)/3, availh/2) ; edi=availh/2 */
+    movl fbw(%rip),%eax
+    movl gap(%rip),%edx
+    shll $2,%edx
+    subl %edx,%eax
+    xorl %edx,%edx
+    movl $3,%ecx
+    divl %ecx
+    cmpl %edi,%eax
+    jbe 4f
+    movl %edi,%eax
+4:  movl %eax,s2side(%rip)
+    movl fbw(%rip),%edx        /* v2x0 = (fbw-3*s2-2gap)/2 */
+    leal (%rax,%rax,2),%ecx
+    subl %ecx,%edx
+    movl gap(%rip),%ecx
+    subl %ecx,%edx
+    subl %ecx,%edx
+    shrl $1,%edx
+    movl %edx,v2x0(%rip)
+    addl %eax,%edx
+    addl %ecx,%edx
+    movl %edx,v2x1(%rip)
+    addl %eax,%edx
+    addl %ecx,%edx
+    movl %edx,v2x2(%rip)
+    movl hudh(%rip),%edx
+    addl %ecx,%edx
+    movl %edx,y2l0(%rip)
+    addl lab(%rip),%edx
+    movl %edx,v2y0(%rip)
+    addl %eax,%edx
+    addl %ecx,%edx
+    movl %edx,y2l1(%rip)
+    addl lab(%rip),%edx
+    movl %edx,v2y1(%rip)
+    movl tsl(%rip),%eax
     imull $30,%eax,%esi
     addl $6,%esi
     movl fbh(%rip),%edx
@@ -914,6 +978,17 @@ sdl:
     jnz 4f
     decl %eax
 4:  movl %eax,maxwinN(%rip)
+    movl N(%rip),%eax          /* 2D window: max = odd(2N-1) cap 401 */
+    leal -1(%rax,%rax),%eax
+    cmpl $401,%eax
+    jbe 5f
+    movl $401,%eax
+5:  movl %eax,w2max(%rip)
+    cmpl $41,%eax              /* default = min(41, w2max) */
+    jbe 6f
+    movl $41,%eax
+6:  movl %eax,w2def(%rip)
+    movl %eax,w2win(%rip)
     movb $21,vyaw(%rip)
     movb $21,vyaw+1(%rip)
     movb $21,vyaw+2(%rip)
@@ -1107,7 +1182,11 @@ game_key:
     movl $7,%edi
     cmpb $0x25,%al             /* K: -w kata */
     je domv
-    cmpb $0x02,%al             /* 1-4: select view */
+    cmpb $0x0F,%al             /* TAB: toggle 3D/2D projections */
+    jne 0f
+    xorl $1,viewmode(%rip)
+    jmp game_redraw
+0:  cmpb $0x02,%al             /* 1-4: select view */
     jb 1f
     cmpb $0x05,%al
     ja 1f
@@ -1138,6 +1217,8 @@ game_key:
     jmp game_redraw
 5:  cmpb $0x16,%al             /* U: zoom in */
     jne 6f
+    cmpl $0,viewmode(%rip)
+    jne 51f
     leaq vwin(%rip),%rdx
     movl (%rdx,%rcx,4),%eax
     subl $2,%eax
@@ -1146,8 +1227,17 @@ game_key:
     movl $3,%eax
 55: movl %eax,(%rdx,%rcx,4)
     jmp game_redraw
+51: movl w2win(%rip),%eax      /* 2D zoom in */
+    subl $2,%eax
+    cmpl $3,%eax
+    jge 52f
+    movl $3,%eax
+52: movl %eax,w2win(%rip)
+    jmp game_redraw
 6:  cmpb $0x18,%al             /* O: zoom out */
     jne 7f
+    cmpl $0,viewmode(%rip)
+    jne 61f
     leaq vwin(%rip),%rdx
     movl (%rdx,%rcx,4),%eax
     addl $2,%eax
@@ -1156,6 +1246,13 @@ game_key:
     movl maxwinN(%rip),%eax
 66: movl %eax,(%rdx,%rcx,4)
     jmp game_redraw
+61: movl w2win(%rip),%eax      /* 2D zoom out */
+    addl $2,%eax
+    cmpl w2max(%rip),%eax
+    jle 62f
+    movl w2max(%rip),%eax
+62: movl %eax,w2win(%rip)
+    jmp game_redraw
 7:  cmpb $0x13,%al             /* R: reset views */
     jne game_key
     movl defwinN(%rip),%eax
@@ -1163,6 +1260,8 @@ game_key:
     movl %eax,vwin+4(%rip)
     movl %eax,vwin+8(%rip)
     movl %eax,vwin+12(%rip)
+    movl w2def(%rip),%eax
+    movl %eax,w2win(%rip)
     movb $21,vyaw(%rip)
     movb $21,vyaw+1(%rip)
     movb $21,vyaw+2(%rip)
@@ -1270,6 +1369,10 @@ draw_all:
     call draw_str
     leaq ecoord(%rip),%rsi
     call draw_vec4
+    movl ts(%rip),%eax         /* legend+labels at small scale */
+    movl %eax,tsav(%rip)
+    movl tsl(%rip),%eax
+    movl %eax,ts(%rip)
     movl legy(%rip),%eax
     movl %eax,cury(%rip)
     movl $16,curx(%rip)
@@ -1283,6 +1386,8 @@ draw_all:
     leaq s_l3(%rip),%rsi
     call draw_str
     movl $0,cvi(%rip)
+    cmpl $0,viewmode(%rip)
+    jne d2_v
 da_v:
     movl cvi(%rip),%ebx
     movl vx0g(%rip),%eax
@@ -1318,44 +1423,91 @@ da_v:
     jne 5f
     movl $ID_ACC,%eax
 5:  movl %eax,m_bc(%rip)
-    movl m_x0(%rip),%edi
-    subl $2,%edi
-    movl m_y0(%rip),%esi
-    subl $2,%esi
-    movl qside(%rip),%edx
-    addl $4,%edx
-    movl $2,%ecx
-    movl m_bc(%rip),%r8d
-    call fill_rect
-    movl m_x0(%rip),%edi
-    subl $2,%edi
-    movl m_y0(%rip),%esi
-    addl qside(%rip),%esi
-    movl qside(%rip),%edx
-    addl $4,%edx
-    movl $2,%ecx
-    movl m_bc(%rip),%r8d
-    call fill_rect
-    movl m_x0(%rip),%edi
-    subl $2,%edi
-    movl m_y0(%rip),%esi
-    movl $2,%edx
-    movl qside(%rip),%ecx
-    movl m_bc(%rip),%r8d
-    call fill_rect
-    movl m_x0(%rip),%edi
-    addl qside(%rip),%edi
-    movl m_y0(%rip),%esi
-    movl $2,%edx
-    movl qside(%rip),%ecx
-    movl m_bc(%rip),%r8d
-    call fill_rect
+    movl qside(%rip),%eax
+    movl %eax,brd(%rip)
+    call draw_border
     call draw_view
     incl cvi(%rip)
     cmpl $4,cvi(%rip)
     jb da_v
+da_done:
+    movl tsav(%rip),%eax       /* restore big text scale */
+    movl %eax,ts(%rip)
     popq %rbx
     ret
+
+/* 2D mode: 6 panels XY XZ XW YZ YW ZW in 3x2 grid */
+d2_v:
+    movl cvi(%rip),%ebx
+    movl %ebx,%ecx             /* col = cvi%3, row = cvi/3 */
+    xorl %edx,%edx
+    cmpl $3,%ecx
+    jb 1f
+    subl $3,%ecx
+    movl $1,%edx
+1:  leaq v2x0(%rip),%rax
+    movl (%rax,%rcx,4),%eax
+    movl %eax,m_x0(%rip)
+    movl v2y0(%rip),%eax
+    movl y2l0(%rip),%ecx
+    testl %edx,%edx
+    jz 2f
+    movl v2y1(%rip),%eax
+    movl y2l1(%rip),%ecx
+2:  movl %eax,m_y0(%rip)
+    movl m_x0(%rip),%eax
+    movl %eax,curx(%rip)
+    movl %ecx,cury(%rip)
+    movl $ID_DIM,colr(%rip)
+    leaq s_vlab2(%rip),%rsi
+    leal (%rbx,%rbx,2),%eax
+    addq %rax,%rsi
+    call draw_str
+    movl $ID_BORD,%eax
+    movl %eax,m_bc(%rip)
+    movl s2side(%rip),%eax
+    movl %eax,brd(%rip)
+    call draw_border
+    call draw_view2
+    incl cvi(%rip)
+    cmpl $6,cvi(%rip)
+    jb d2_v
+    jmp da_done
+
+/* frame around (m_x0-2,m_y0-2), inner side brd, thickness 2, color m_bc */
+draw_border:
+    movl m_x0(%rip),%edi
+    subl $2,%edi
+    movl m_y0(%rip),%esi
+    subl $2,%esi
+    movl brd(%rip),%edx
+    addl $4,%edx
+    movl $2,%ecx
+    movl m_bc(%rip),%r8d
+    call fill_rect
+    movl m_x0(%rip),%edi
+    subl $2,%edi
+    movl m_y0(%rip),%esi
+    addl brd(%rip),%esi
+    movl brd(%rip),%edx
+    addl $4,%edx
+    movl $2,%ecx
+    movl m_bc(%rip),%r8d
+    call fill_rect
+    movl m_x0(%rip),%edi
+    subl $2,%edi
+    movl m_y0(%rip),%esi
+    movl $2,%edx
+    movl brd(%rip),%ecx
+    movl m_bc(%rip),%r8d
+    call fill_rect
+    movl m_x0(%rip),%edi
+    addl brd(%rip),%edi
+    movl m_y0(%rip),%esi
+    movl $2,%edx
+    movl brd(%rip),%ecx
+    movl m_bc(%rip),%r8d
+    jmp fill_rect
 
 /* one 3D view: axes from axtab, angles/window per view */
 draw_view:
@@ -1398,8 +1550,8 @@ draw_view:
     movl %eax,m_v(%rip)
     shrl $1,%eax
     movl %eax,m_h(%rip)
-    movl qside(%rip),%eax      /* pp = Q*37/(64*V) */
-    imull $37,%eax
+    movl qside(%rip),%eax      /* pp = Q*45/(64*V) */
+    imull $45,%eax
     movl m_v(%rip),%ecx
     shll $6,%ecx
     xorl %edx,%edx
@@ -1626,6 +1778,220 @@ mark_draw:                     /* rsi=coords, r8d=color id */
 md_no:
     ret
 
+/* one 2D panel: plane m_ax[0],m_ax[1]; other axes fixed at player */
+draw_view2:
+    pushq %rbx
+    pushq %rbp
+    pushq %r12
+    pushq %r13
+    pushq %r14
+    pushq %r15
+    movl cvi(%rip),%eax
+    leaq ax2tab(%rip),%rcx
+    movzbl (%rcx,%rax,4),%edx
+    movl %edx,m_ax(%rip)
+    movzbl 1(%rcx,%rax,4),%edx
+    movl %edx,m_ax+4(%rip)
+    movzbl 2(%rcx,%rax,4),%edx
+    movl %edx,m_ax+8(%rip)
+    movzbl 3(%rcx,%rax,4),%edx
+    movl %edx,m_ax+12(%rip)
+    movl w2win(%rip),%eax      /* effective window: fit panel */
+    movl s2side(%rip),%ecx
+    testl $1,%ecx
+    jnz 1f
+    decl %ecx
+1:  cmpl %ecx,%eax
+    jbe 2f
+    movl %ecx,%eax
+2:  movl %eax,m2_w(%rip)
+    movl %eax,%ecx
+    shrl $1,%ecx
+    movl %ecx,m_h(%rip)
+    movl m_ax(%rip),%eax       /* strides */
+    leaq stride(%rip),%rcx
+    movq (%rcx,%rax,8),%rdx
+    movq %rdx,m_sA(%rip)
+    movl m_ax+4(%rip),%eax
+    movq (%rcx,%rax,8),%rdx
+    movq %rdx,m_sB(%rip)
+    xorl %ecx,%ecx             /* clip ranges both axes */
+rg22:
+    leaq m_ax(%rip),%rax
+    movl (%rax,%rcx,4),%eax
+    leaq pcoord(%rip),%rdx
+    movl (%rdx,%rax,4),%edx
+    movl m_h(%rip),%eax
+    movl %eax,%edi
+    negl %edi
+    movl %edx,%esi
+    negl %esi
+    cmpl %esi,%edi
+    jge 1f
+    movl %esi,%edi
+1:  leaq m_lo(%rip),%rsi
+    movl %edi,(%rsi,%rcx,4)
+    movl N(%rip),%edi
+    decl %edi
+    subl %edx,%edi
+    cmpl %eax,%edi
+    jle 2f
+    movl %eax,%edi
+2:  leaq m_hi(%rip),%rsi
+    movl %edi,(%rsi,%rcx,4)
+    incl %ecx
+    cmpl $2,%ecx
+    jb rg22
+    leaq pcoord(%rip),%rsi
+    call vox_addr_v
+    movq %rax,m_pa(%rip)
+    movl m_hi(%rip),%eax       /* auto-fit: cp from visible extent */
+    subl m_lo(%rip),%eax
+    incl %eax                  /* vis0 = cols */
+    movl m_hi+4(%rip),%edx
+    subl m_lo+4(%rip),%edx
+    incl %edx                  /* vis1 = rows */
+    movl %eax,%ecx
+    cmpl %edx,%ecx
+    jge 6f
+    movl %edx,%ecx             /* vismax */
+6:  pushq %rax
+    pushq %rdx
+    movl s2side(%rip),%eax
+    xorl %edx,%edx
+    divl %ecx
+    testl %eax,%eax
+    jnz 7f
+    movl $1,%eax
+7:  movl %eax,m2_cp(%rip)
+    movl %eax,%edx             /* cell fill size = max(1,cp-1) */
+    decl %edx
+    jnz 8f
+    movl $1,%edx
+8:  movl %edx,m2_sz(%rip)
+    popq %rdx
+    popq %rcx                  /* rcx=vis0, rdx=vis1 */
+    movl m2_cp(%rip),%eax      /* gx = x0+(s2-vis0*cp)/2-lo0*cp */
+    imull %eax,%ecx
+    movl s2side(%rip),%edi
+    subl %ecx,%edi
+    shrl $1,%edi
+    addl m_x0(%rip),%edi
+    movl m_lo(%rip),%ecx
+    imull %eax,%ecx
+    subl %ecx,%edi
+    movl %edi,m2_gx(%rip)
+    imull %eax,%edx            /* gy likewise */
+    movl s2side(%rip),%edi
+    subl %edx,%edi
+    shrl $1,%edi
+    addl m_y0(%rip),%edi
+    movl m_lo+4(%rip),%ecx
+    imull %eax,%ecx
+    subl %ecx,%edi
+    movl %edi,m2_gy(%rip)
+    movl m_lo(%rip),%r12d      /* cell loop */
+v2A:
+    cmpl m_hi(%rip),%r12d
+    jg v2mk
+    movslq %r12d,%rax
+    imulq m_sA(%rip),%rax
+    addq m_pa(%rip),%rax
+    movq %rax,m_aA(%rip)
+    movl %r12d,%eax            /* px for this column */
+    imull m2_cp(%rip),%eax
+    addl m2_gx(%rip),%eax
+    movl %eax,m2_px(%rip)
+    movl m_lo+4(%rip),%r13d
+    movslq %r13d,%rax
+    imulq m_sB(%rip),%rax
+    addq m_aA(%rip),%rax
+    movq %rax,%rbp             /* voxel address */
+    movl %r13d,%r14d           /* py */
+    imull m2_cp(%rip),%r14d
+    addl m2_gy(%rip),%r14d
+v2B:
+    cmpl m_hi+4(%rip),%r13d
+    jg v2Be
+    movzbl 0(%rbp),%eax
+    movl $(ID_G0+3),%r8d       /* wall: dark */
+    testb $1,%al
+    jnz 5f
+    movl $(ID_G0+1),%r8d       /* open: light */
+5:  movl m2_px(%rip),%edi
+    movl %r14d,%esi
+    movl m2_sz(%rip),%edx
+    movl %edx,%ecx
+    call fill_rect
+    addq m_sB(%rip),%rbp
+    addl m2_cp(%rip),%r14d
+    incl %r13d
+    jmp v2B
+v2Be:
+    incl %r12d
+    jmp v2A
+v2mk:
+    leaq ecoord(%rip),%rsi
+    movl $ID_EXIT,%r8d
+    call mark2
+    leaq svec(%rip),%rsi
+    movl $ID_START,%r8d
+    call mark2
+    movl m2_gx(%rip),%edi      /* player at rel (0,0) */
+    movl m2_gy(%rip),%esi
+    movl m2_sz(%rip),%edx
+    movl %edx,%ecx
+    movl $ID_PLY,%r8d
+    call fill_rect
+    popq %r15
+    popq %r14
+    popq %r13
+    popq %r12
+    popq %rbp
+    popq %rbx
+    ret
+
+mark2:                         /* rsi=coords, r8d=color: 2D marker */
+    movl %r8d,m_mid(%rip)
+    movq %rsi,m_mt(%rip)
+    movl m_ax+8(%rip),%eax     /* both fixed axes must match */
+    leaq pcoord(%rip),%rcx
+    movl (%rcx,%rax,4),%edx
+    cmpl (%rsi,%rax,4),%edx
+    jne mk2_no
+    movl m_ax+12(%rip),%eax
+    movl (%rcx,%rax,4),%edx
+    cmpl (%rsi,%rax,4),%edx
+    jne mk2_no
+    movl m_ax(%rip),%eax       /* rel on plane axes, clipped */
+    movl (%rsi,%rax,4),%edx
+    subl (%rcx,%rax,4),%edx
+    cmpl m_lo(%rip),%edx
+    jl mk2_no
+    cmpl m_hi(%rip),%edx
+    jg mk2_no
+    movl %edx,m_rel(%rip)
+    movl m_ax+4(%rip),%eax
+    movl (%rsi,%rax,4),%edx
+    subl (%rcx,%rax,4),%edx
+    cmpl m_lo+4(%rip),%edx
+    jl mk2_no
+    cmpl m_hi+4(%rip),%edx
+    jg mk2_no
+    movl m_rel(%rip),%eax
+    imull m2_cp(%rip),%eax
+    addl m2_gx(%rip),%eax
+    movl %eax,%edi
+    imull m2_cp(%rip),%edx
+    addl m2_gy(%rip),%edx
+    movl %edx,%esi
+    movl m2_sz(%rip),%edx
+    movl %edx,%ecx
+    movl m_mid(%rip),%r8d
+    jmp fill_rect
+mk2_no:
+    ret
+
 /* rotate+project cell offset: in rcx=dx rdx=dy rbx=dz
  * out eax=sx esi=sy edi=depth band 0-3; clobbers rdx,r8-r11 */
 xform:
@@ -1704,9 +2070,28 @@ dot_draw:
 9:  ret
 
 /* ---------------- primitives ---------------- */
-/* edi=x esi=y edx=w ecx=h r8d=color id; preserves rbx,rbp,r12-r15 */
+/* edi=x esi=y edx=w ecx=h r8d=color id; preserves rbx,rbp,r12-r15
+ * clips to the framebuffer, safe for any mode geometry */
 fill_rect:
-    testl %edx,%edx
+    testl %edi,%edi            /* x<0: shrink w, clamp x */
+    jns 1f
+    addl %edi,%edx
+    xorl %edi,%edi
+1:  testl %esi,%esi            /* y<0 */
+    jns 2f
+    addl %esi,%ecx
+    xorl %esi,%esi
+2:  movl fbw(%rip),%eax        /* right edge */
+    subl %edi,%eax
+    cmpl %eax,%edx
+    jle 3f
+    movl %eax,%edx
+3:  movl fbh(%rip),%eax        /* bottom edge */
+    subl %esi,%eax
+    cmpl %eax,%ecx
+    jle 4f
+    movl %eax,%ecx
+4:  testl %edx,%edx
     jle fr_ret
     testl %ecx,%ecx
     jle fr_ret
@@ -1975,6 +2360,7 @@ sinv:                          /* edi=angle 0-255 -> eax=sin*16383 */
 
 /* ---------------- data ---------------- */
 axtab:  .byte 0,1,2,3, 0,1,3,2, 0,2,3,1, 1,2,3,0
+ax2tab: .byte 0,1,2,3, 0,2,1,3, 0,3,1,2, 1,2,0,3, 1,3,0,2, 2,3,0,1
 dsgn2:  .long 2,-2
 dsgn1:  .long 1,-1
 scan2dig: .ascii "1234567890"
@@ -1982,6 +2368,12 @@ s_vlab: .asciz "XYZ"
         .asciz "XYW"
         .asciz "XZW"
         .asciz "YZW"
+s_vlab2:.asciz "XY"
+        .asciz "XZ"
+        .asciz "XW"
+        .asciz "YZ"
+        .asciz "YW"
+        .asciz "ZW"
 s_act:  .asciz " *"
 s_t1:   .asciz "4D MAZE - AMD64 LONG MODE OS"
 s_t2:   .asciz "FLAT IDENTITY MAP - NO PROTECTION"
@@ -1996,7 +2388,7 @@ s_epos: .asciz "ENTER A POSITIVE NUMBER"
 s_goal: .asciz "GOAL: FROM 1,1,1,1 TO GREEN EXIT"
 s_l1:   .asciz "DOTS:OPEN YEL:YOU GRN:EXIT BLU:START"
 s_l2:   .asciz "ARROWS:XY W/S:Z A/K:W(4D) ESC:MENU"
-s_l3:   .asciz "1-4:VIEW J/L I/M:ROTATE U/O:ZOOM R:RST"
+s_l3:   .asciz "TAB:2D/3D 1-4:VIEW J/L I/M:ROT U/O:ZOOM R:RST"
 s_gen:  .asciz "GENERATING 4D MAZE, N="
 s_hmov: .asciz "MOVES:"
 s_hn:   .asciz "  N:"
@@ -2048,6 +2440,7 @@ fbw:     .long 0
 fbh:     .long 0
 fbbpp:   .long 0
 bestsc:  .long 0
+bestlim: .long 0
 bestmd:  .word 0
 curmd:   .word 0
 mcnt:    .word 0
@@ -2056,6 +2449,8 @@ N:       .long 0
 maxc:    .long 0
 maxN:    .long 0
 ts:      .long 1
+tsl:     .long 1
+tsav:    .long 1
 gap:     .long 8
 bytespp: .long 4
 qside:   .long 0
@@ -2068,6 +2463,25 @@ yl1:     .long 0
 legy:    .long 0
 lab:     .long 0
 hudh:    .long 0
+s2side:  .long 0
+v2x0:    .long 0
+v2x1:    .long 0
+v2x2:    .long 0
+y2l0:    .long 0
+y2l1:    .long 0
+v2y0:    .long 0
+v2y1:    .long 0
+viewmode:.long 0
+w2win:   .long 41
+w2max:   .long 41
+w2def:   .long 41
+m2_w:    .long 0
+m2_cp:   .long 0
+m2_sz:   .long 0
+m2_gx:   .long 0
+m2_gy:   .long 0
+m2_px:   .long 0
+brd:     .long 0
 defwin:  .long 15
 defwinN: .long 15
 maxwinN: .long 29
