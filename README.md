@@ -96,7 +96,9 @@ voxels for even N; the menu shows X for your N — e.g. N=5 → 464, N=7 → 189
 N=9 → 5312). The pass streams over the whole volume once and removes each
 still-standing wall with probability `need/remaining` (sequential random
 sampling), which picks every R-subset with equal probability using no extra
-memory. R = 0 is a perfect maze; **R = X removes every wall, leaving a
+memory; like generation, the pass drives its own progress bar (the removal
+scan over huge volumes takes a moment under TCG). R = 0 is a perfect maze;
+**R = X removes every wall, leaving a
 completely open N⁴ box** (shortest path = the Manhattan distance 4·(N−1)).
 Removed walls create loops — multiple routes to the exit exist, shortest
 paths get much shorter, and the 2D projections visibly open up.

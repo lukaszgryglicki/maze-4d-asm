@@ -1432,11 +1432,18 @@ gnost:
     movl $ID_TXT,colr(%rip)
     leaq s_rmw(%rip),%rsi
     call draw_str
+    movl barx(%rip),%edi       /* reset the bar for removal progress */
+    movl bary(%rip),%esi
+    movl barw(%rip),%edx
+    movl barh(%rip),%ecx
+    movl $ID_BG,%r8d
+    call fill_rect
 /* Sequential random sampling over a single linear scan of all N^4 voxel
  * bytes: every still-full voxel (byte==1) is a candidate; rem starts at
  * maxrm (the exact number of full voxels, see menu_walls) and an unbroken
  * wall is removed with probability need/rem, which picks every possible
- * subset of `need` walls with equal probability. */
+ * subset of `need` walls with equal probability.  The bar refills with
+ * scan progress (updated every ~1M voxels). */
     movq maxrm(%rip),%r15      /* rem = full voxels left to consider */
     testq %r15,%r15
     jz grt
@@ -1466,7 +1473,21 @@ rmk:
 rmn:
     incq %rbx
     decq %rbp
+    jz grt
+    testl $0xFFFFF,%ebp        /* progress bar every ~1M voxels */
     jnz rml
+    movq total(%rip),%rax
+    subq %rbp,%rax             /* voxels scanned so far */
+    movslq barw(%rip),%rcx
+    mulq %rcx
+    divq total(%rip)
+    movl %eax,%edx
+    movl barx(%rip),%edi
+    movl bary(%rip),%esi
+    movl barh(%rip),%ecx
+    movl $ID_BAR,%r8d
+    call fill_rect
+    jmp rml
 grt:
     popq %r15
     popq %r14
