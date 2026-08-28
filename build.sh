@@ -1,6 +1,14 @@
 #!/bin/sh
 # Build maze4d.img (bootable flat binary). Works on Linux (gcc/binutils)
 # and FreeBSD (clang/lld). cc -c is required: cpp expands the A() macro.
+#
+# Pipeline: assemble maze4d.S -> link as a flat binary at 0x7C00 (the BIOS
+# boot address; tries several linkers, then an ELF+objcopy fallback) ->
+# enforce the size limit -> pad to 1 MiB.
+#
+# The 32256-byte (63-sector) limit: the boot sector loads NSECT=62 more
+# sectors after itself (63 * 512 = 32256).  If the binary outgrows it,
+# NSECT in maze4d.S must be raised together with this check.
 set -e
 cd "$(dirname "$0")"
 CC="${CC:-cc}"

@@ -88,7 +88,7 @@
  *              bar: its marks form a shortest-path tree over the whole
  *              volume, cached for both B and H (bestok + optok flags)
  *              until the maze is regenerated.
- *   rng        xorshift32, seeded from the TSC at boot.
+ *   rng        xorshift32, seeded at boot from TSC ^ PIT ^ RTC seconds.
  *
  * ----------------------------------------------------------------------
  * DISPLAY & CONTROLS
@@ -107,6 +107,42 @@
  *   Menu flow: N >= 2 (maze is N^4 voxels) -> maze type (1 perfect /
  *   2 sparse) -> for sparse: how many walls to remove (0..X).
  *   Score = number of moves, lower is better.
+ *
+ * ----------------------------------------------------------------------
+ * CODE MAP (in file order)
+ * ----------------------------------------------------------------------
+ *   _start..dap      16-bit boot sector: LBA/CHS disk load, MBR magic
+ *   stage2           A20, E820 map, font copy, VBE scan + mode set
+ *   pm32             32-bit trampoline: bootstrap page tables, to long mode
+ *   lm64             64-bit init: sine table, full identity map, maze
+ *                    region pick, video derived values, screen layout
+ *   menu/menu_type/menu_walls  the three menu screens
+ *   setup_n          everything derived from N, then gen_maze
+ *   gen_maze/gdon    perfect-maze DFS carver + staircase + sparse pass
+ *   game_redraw/game_key       main loop: keyboard dispatch
+ *   try_move/rnd_move          movement + X key
+ *   srch_init/find_opt/mark_dir/sweep_marks/find_best  H and B keys
+ *   win_scr          score screen
+ *   draw_all/draw_view/draw_view2/mark_draw/mark2/draw_border  renderer
+ *   xform/dot_draw   3D math + clipped dot
+ *   fill_rect/clear_fb/draw_char/draw_str/draw_dec/draw_vec4/menu_nl/itoa
+ *   getkey/seed_rng/rng_next/rng_below/vox_addr_v/sinv
+ *   data             tables, strings, palette, variables
+ *
+ * ----------------------------------------------------------------------
+ * CONVENTIONS
+ * ----------------------------------------------------------------------
+ *   No ABI: arguments go in whatever registers each helper documents,
+ *   shared state lives in RIP-relative globals (this is a single-threaded
+ *   ring-0 program - globals are simply fastest and smallest).
+ *   fill_rect preserves rbx/rbp/r12-r15 (callers rely on it inside their
+ *   loops); draw_char/draw_str preserve everything they use except
+ *   rax/rcx/rdx/rdi and rsi advancing over the string.
+ *   Trig is 2.14 fixed point: sinv() returns sin(angle)*16383 with the
+ *   angle as a byte 0..255 = full turn (so +64 = +90 deg gives cosine).
+ *   16/32-bit code addresses need the A(x) cpp macro because the image
+ *   is linked at 0x7C00 but .org-style symbols are section-relative;
+ *   64-bit code uses plain RIP-relative addressing everywhere.
  *
  * Build: cc -c (cpp needed for A()), link flat binary at 0x7C00.
  */
@@ -143,37 +179,42 @@
     .text
     .code16
     .globl _start
+/* ---------------- boot sector (the first 512 bytes) ----------------
+ * BIOS drops us here at 0000:7C00 with DL = boot drive.  Load the NSECT
+ * sectors that follow the boot sector to 0x7E00 and jump to stage2.
+ * Interrupts are briefly disabled while the segment registers and stack
+ * are set up (SS:SP change must be atomic on some old CPUs). */
 _start:
     cli
     xorw %ax,%ax
     movw %ax,%ds
     movw %ax,%es
     movw %ax,%ss
-    movw $LOAD,%sp
+    movw $LOAD,%sp             /* stack right below the image */
     sti
     cld
-    ljmpw $0,$A(bs_go)
+    ljmpw $0,$A(bs_go)         /* normalize CS:IP (some BIOSes use 07C0:0) */
 bs_go:
     movb %dl,A(drv)
-    movw $A(dap),%si            /* try LBA read first */
-    movb $0x42,%ah
-    movb A(drv),%dl
+    movw $A(dap),%si            /* try LBA read first: INT 13h AH=42h with */
+    movb $0x42,%ah              /* the disk address packet below - one     */
+    movb A(drv),%dl             /* call loads all NSECT sectors            */
     int $0x13
     jnc bs_ok
     movb $8,%ah                 /* CHS fallback: get geometry */
     movb A(drv),%dl
     int $0x13
     jc bs_err
-    andb $0x3F,%cl
+    andb $0x3F,%cl             /* CL bits 0-5 = sectors per track */
     movb %cl,A(spt)
-    movb %dh,A(hds)
-    movw $1,A(clba)
+    movb %dh,A(hds)            /* DH = max head index */
+    movw $1,A(clba)            /* start at LBA 1 (sector after boot) */
     movw $NSECT,A(scnt)
-    movw $0x07E0,A(dseg)
+    movw $0x07E0,A(dseg)       /* destination segment 07E0:0 = 0x7E00 */
 bs_next:
-    movw A(clba),%ax
-    xorw %dx,%dx
-    xorw %bx,%bx
+    movw A(clba),%ax           /* LBA -> CHS: sector = lba%spt + 1, */
+    xorw %dx,%dx               /* then cyl = (lba/spt)/heads,       */
+    xorw %bx,%bx               /* head = (lba/spt)%heads            */
     movb A(spt),%bl
     divw %bx                    /* ax=lba/spt dx=rem */
     incw %dx
@@ -184,28 +225,28 @@ bs_next:
     incw %bx
     divw %bx                    /* ax=cyl dx=head */
     movb %dl,%dh
-    movb %ah,%bl
+    movb %ah,%bl               /* pack cylinder bits 8-9 into CL 6-7 */
     shlb $6,%bl
     orb %bl,%cl
     movb %al,%ch
     movw A(dseg),%ax
     movw %ax,%es
     xorw %bx,%bx
-    movw $3,%si
+    movw $3,%si                /* 3 attempts per sector */
 bs_retry:
-    movb $0x02,%ah
+    movb $0x02,%ah             /* INT 13h AH=02h: read 1 sector */
     movb $1,%al
     movb A(drv),%dl
     int $0x13
     jnc bs_got
-    xorw %ax,%ax
+    xorw %ax,%ax               /* AH=00h: reset disk, then retry */
     movb A(drv),%dl
     int $0x13
     decw %si
     jnz bs_retry
     jmp bs_err
 bs_got:
-    addw $0x20,A(dseg)
+    addw $0x20,A(dseg)         /* +0x20 paragraphs = +512 bytes */
     incw A(clba)
     decw A(scnt)
     jnz bs_next
@@ -214,7 +255,7 @@ bs_ok:
     movw %ax,%es
     jmp stage2
 bs_err:
-    movw $A(s_derr),%si
+    movw $A(s_derr),%si        /* print "DISK ERR" via BIOS teletype */
 1:  lodsb
     testb %al,%al
     jz 2f
@@ -225,41 +266,48 @@ bs_err:
 2:  hlt
     jmp 2b
 
-drv:  .byte 0
-spt:  .byte 18
-hds:  .byte 1
-clba: .word 0
-scnt: .word 0
-dseg: .word 0
+drv:  .byte 0                  /* BIOS boot drive number */
+spt:  .byte 18                 /* sectors per track (CHS fallback) */
+hds:  .byte 1                  /* max head index */
+clba: .word 0                  /* current LBA being loaded */
+scnt: .word 0                  /* sectors left to load */
+dseg: .word 0                  /* current destination segment */
 s_derr: .asciz "DISK ERR"
     .p2align 2
-dap:
-    .byte 0x10,0
-    .word NSECT
-    .word 0x7E00,0
-    .quad 1
+dap:                           /* INT 13h AH=42h disk address packet */
+    .byte 0x10,0               /* size 16, reserved */
+    .word NSECT                /* sector count */
+    .word 0x7E00,0             /* destination offset:segment */
+    .quad 1                    /* starting LBA */
 
-    .org 446                   /* partition table for picky BIOSes */
+    .org 446                   /* partition table for picky BIOSes that
+                                * refuse to boot media without one */
     .byte 0x80,0,2,0,0x83,0xFE,0xFF,0xFF
     .long 1,2048
     .org 510
-    .word 0xAA55
+    .word 0xAA55               /* boot signature */
 
-/* ---------------- 16-bit stage 2 ---------------- */
+/* ---------------- 16-bit stage 2 ----------------
+ * Everything that still needs BIOS services: A20 gate, E820 memory map,
+ * a copy of the 8x8 VGA font, and VESA mode selection.  All results are
+ * parked at fixed low-memory addresses (see PHYSICAL MEMORY MAP) so the
+ * 64-bit code can read them later without any BIOS. */
 stage2:
-    movw $0x2401,%ax           /* A20 via BIOS */
+    movw $0x2401,%ax           /* A20 via BIOS... */
     int $0x15
-    inb $0x92,%al              /* and fast gate */
-    orb $2,%al
-    andb $0xFE,%al
+    inb $0x92,%al              /* ...and via the port 0x92 fast gate */
+    orb $2,%al                 /* (bit1 = A20). Clear bit0 - it resets */
+    andb $0xFE,%al             /* the CPU on some chipsets! */
     outb %al,$0x92
 
-    xorl %ebx,%ebx             /* E820 memory map -> E820AT */
-    movw $0,E820AT
-    movw $E820AT+0x10,%di
+    xorl %ebx,%ebx             /* E820 memory map -> E820AT.  EBX is the
+                                * BIOS continuation cookie, 0 = first call,
+                                * 0 again on return = list done. */
+    movw $0,E820AT             /* entry count word */
+    movw $E820AT+0x10,%di      /* 24-byte entries from +0x10 */
 e8l:
     movl $0xE820,%eax
-    movl $0x534D4150,%edx
+    movl $0x534D4150,%edx      /* 'SMAP' magic */
     movl $24,%ecx
     int $0x15
     jc e8d
@@ -267,12 +315,16 @@ e8l:
     jne e8d
     incw E820AT
     addw $24,%di
-    cmpw $E820AT+0x10+24*32,%di
+    cmpw $E820AT+0x10+24*32,%di /* keep at most 32 entries */
     jae e8d
     testl %ebx,%ebx
     jnz e8l
 e8d:
-    pushw %ds                  /* copy 8x8 BIOS font to FONT */
+    pushw %ds                  /* copy the 8x8 BIOS font to FONT: INT 10h
+                                * AX=1130h BH=3 returns ES:BP = font table.
+                                * Only 128 glyphs (1 KiB) are copied - all
+                                * strings are plain ASCII and draw_char
+                                * masks codes with 0x7F. */
     movw $0x1130,%ax
     movb $3,%bh
     int $0x10                  /* ES:BP = font */
@@ -288,13 +340,22 @@ e8d:
     xorw %ax,%ax
     movw %ax,%es
 
-    movl $0x32454256,VBEI      /* "VBE2" */
+/* VESA scan: walk the controller's mode list and score every usable LFB
+ * mode by resolution (score = area*4 | bytes-per-pixel, so bigger area
+ * always wins and higher depth breaks ties).  Modes must be supported +
+ * graphics + linear-framebuffer (attrs mask 0x91) and have a pixel
+ * format the renderer knows: 8bpp packed with a programmable DAC, 16bpp
+ * RGB565, or 24/32bpp XRGB (red channel at bit 16).  If setting the
+ * winning mode fails, that score becomes the new upper limit (bestlim)
+ * and the scan reruns, effectively falling back tier by tier; if no VBE
+ * mode works at all, plain VGA 320x200x8 (mode 13h) is used. */
+    movl $0x32454256,VBEI      /* "VBE2": ask for VBE 2.0+ info */
     movw $0x4F00,%ax
     movw $VBEI,%di
     int $0x10
-    cmpw $0x004F,%ax
+    cmpw $0x004F,%ax           /* AL=4F: supported, AH=0: success */
     jne vbe_fb
-    cmpl $0x41534556,VBEI      /* "VESA" */
+    cmpl $0x41534556,VBEI      /* "VESA" signature in the info block */
     jne vbe_fb
     movw VBEI+0x0E,%si         /* mode list far ptr */
     movw VBEI+0x10,%ax
@@ -305,15 +366,15 @@ vbe_scan:
     movw VBEI+0x0E,%si
     movl $0,A(bestsc)
     movw $0,A(bestmd)
-    movw $128,A(mcnt)
+    movw $128,A(mcnt)          /* sane cap on mode list length */
 vbe_l:
-    movw %fs:(%si),%cx
+    movw %fs:(%si),%cx         /* next mode number, 0xFFFF = end */
     cmpw $0xFFFF,%cx
     je vbe_sel
     addw $2,%si
     movw %cx,A(curmd)
     pushw %si
-    movw $0x4F01,%ax
+    movw $0x4F01,%ax           /* fetch mode info block */
     movw $MODEI,%di
     int $0x10
     popw %si
@@ -379,13 +440,13 @@ vbe_sel:
     int $0x10
     cmpw $0x004F,%ax
     jne vbe_bad
-    movw $0x4F02,%ax
+    movw $0x4F02,%ax           /* set it */
     movw A(bestmd),%bx
-    orw $0x4000,%bx            /* LFB */
+    orw $0x4000,%bx            /* bit14 = use the linear framebuffer */
     int $0x10
     cmpw $0x004F,%ax
     jne vbe_bad
-    movl MODEI+0x28,%eax
+    movl MODEI+0x28,%eax       /* stash geometry for the 64-bit code */
     movl %eax,A(fbphys)
     movzwl MODEI+0x10,%eax
     movl %eax,A(fbpitch)
@@ -409,14 +470,23 @@ vbe_fb:
     movl $200,A(fbh)
     movl $8,A(fbbpp)
 vbe_ok:
-    cli
+    cli                        /* BIOS is done - interrupts stay off for
+                                * the rest of the program's life (no IDT
+                                * is ever loaded; keyboard is polled) */
     lgdtl A(gdtdesc)
     movl %cr0,%eax
-    orb $1,%al
+    orb $1,%al                 /* CR0.PE: protected mode */
     movl %eax,%cr0
-    ljmpl $0x18,$A(pm32)
+    ljmpl $0x18,$A(pm32)       /* far jump loads the 32-bit code seg */
 
-/* ---------------- 32-bit trampoline ---------------- */
+/* ---------------- 32-bit trampoline ----------------
+ * Long mode cannot be entered from real mode directly: it needs paging.
+ * This stub builds a minimal "bootstrap" identity map (1 PML4 + 1 PDPT
+ * + 4 PDs of 2 MiB pages = the first 4 GiB), then flips on PAE, LME and
+ * paging.  The map is deliberately RWX with no write protection - the
+ * whole point of the "modern unreal mode" is one flat address space
+ * where everything is allowed.  lm64 later rebuilds a bigger map that
+ * covers ALL detected RAM. */
     .code32
 pm32:
     movw $0x10,%ax
@@ -427,19 +497,19 @@ pm32:
     movw %ax,%gs
     movl $LOAD,%esp
     xorl %eax,%eax             /* bootstrap identity map: 4 GiB */
-    movl $BPML4,%edi
-    movl $0x1800,%ecx
+    movl $BPML4,%edi           /* zero PML4+PDPT+4 PDs (6 pages = */
+    movl $0x1800,%ecx          /* 0x1800 dwords) in one go        */
     rep stosl
-    movl $BPDPT+3,BPML4
-    movl $BPD+0x0003,BPDPT
-    movl $BPD+0x1003,BPDPT+8
+    movl $BPDPT+3,BPML4        /* PML4[0] -> PDPT (present|rw) */
+    movl $BPD+0x0003,BPDPT     /* PDPT[0..3] -> the four PDs,  */
+    movl $BPD+0x1003,BPDPT+8   /* each PD maps 1 GiB           */
     movl $BPD+0x2003,BPDPT+16
     movl $BPD+0x3003,BPDPT+24
     movl $BPD,%edi
     xorl %esi,%esi
-1:  movl %esi,%eax
-    shll $21,%eax
-    orl $0x83,%eax             /* present|rw|2MiB */
+1:  movl %esi,%eax             /* 2048 PD entries: entry i maps   */
+    shll $21,%eax              /* physical i*2MiB                 */
+    orl $0x83,%eax             /* present|rw|2MiB (PS bit) */
     movl %eax,(%edi)
     movl $0,4(%edi)
     addl $8,%edi
@@ -449,24 +519,29 @@ pm32:
     movl $BPML4,%eax
     movl %eax,%cr3
     movl %cr4,%eax
-    orl $0x20,%eax             /* PAE */
+    orl $0x20,%eax             /* CR4.PAE - required for long mode */
     movl %eax,%cr4
-    movl $0xC0000080,%ecx      /* EFER.LME (no NXE: no protection) */
+    movl $0xC0000080,%ecx      /* EFER MSR: set LME (long mode enable).
+                                * NXE is left OFF on purpose - no page
+                                * is ever no-execute here. */
     rdmsr
     orl $0x100,%eax
     wrmsr
     movl %cr0,%eax
-    andl $0xFFFAFFF3,%eax      /* clear WP,AM,EM,TS */
-    orl $0x80000003,%eax       /* PG|MP|PE */
+    andl $0xFFFAFFF3,%eax      /* clear WP,AM,EM,TS: no write protect,
+                                * no alignment checks, x87 native */
+    orl $0x80000003,%eax       /* PG|MP|PE - paging on => long mode active */
     movl %eax,%cr0
-    ljmpl $0x08,$A(lm64)
+    ljmpl $0x08,$A(lm64)       /* far jump into the 64-bit code segment */
 
+/* GDT: three flat 4 GiB/64-bit segments; no TSS, no user segments -
+ * everything runs in ring 0 forever. */
     .p2align 3
 gdt:
     .quad 0
-    .quad 0x00209A0000000000   /* 0x08 64-bit code */
-    .quad 0x00CF92000000FFFF   /* 0x10 data */
-    .quad 0x00CF9A000000FFFF   /* 0x18 32-bit code */
+    .quad 0x00209A0000000000   /* 0x08 64-bit code (L=1) */
+    .quad 0x00CF92000000FFFF   /* 0x10 data (flat 4 GiB) */
+    .quad 0x00CF9A000000FFFF   /* 0x18 32-bit code (D=1, flat) */
 gdt_end:
 gdtdesc:
     .word gdt_end-gdt-1
@@ -483,20 +558,27 @@ lm64:
     movw %ax,%gs
     movq $STK64,%rsp
     cld
-    fninit                     /* x87 to build the sine table */
+    fninit                     /* Build the sine table with the x87 FPU
+                                * once, at boot: sintab[i] =
+                                * round(sin(i*2pi/256) * 16383).
+                                * 16383 = 2.14 fixed point amplitude;
+                                * an angle byte 0..255 is a full turn.
+                                * All later trig is table lookups. */
     xorl %ecx,%ecx
 1:  movw %cx,tmpw(%rip)
     filds tmpw(%rip)
-    fmull c_ang(%rip)
+    fmull c_ang(%rip)          /* * 2pi/256 */
     fsin
-    fmull c_amp(%rip)
+    fmull c_amp(%rip)          /* * 16383 */
     leaq sintab(%rip),%rdx
-    fistps (%rdx,%rcx,2)
+    fistps (%rdx,%rcx,2)       /* store rounded int16 */
     incl %ecx
     cmpl $256,%ecx
     jb 1b
 
-    /* topaddr = highest usable E820 end, >=4GiB, <=16TiB */
+    /* topaddr = highest usable E820 end, >=4GiB, <=16TiB.  This is how
+     * much address space the final identity map must cover (the 4 GiB
+     * floor keeps the LFB and any MMIO mapped even on small RAM). */
     movq $0x100000000,%rax
     movq %rax,topaddr(%rip)
     movzwl E820AT,%ecx
@@ -521,65 +603,70 @@ tp_d:
     jbe 1f
     movq %rax,topaddr(%rip)
 1:
-    /* rebuild identity map covering all of topaddr at TBL */
+    /* Rebuild the identity map at TBL (1 MiB) so it covers everything
+     * up to topaddr.  Layout is contiguous: PML4 page first, then all
+     * PDPT pages, then (2 MiB path only) all PD pages; tblend records
+     * where the tables stop so the maze region can start above them.
+     * 1 GiB pages are preferred when the CPU has pdpe1gb - the whole
+     * map is then just PML4 + PDPTs. */
     movl $0x80000000,%eax
     cpuid
     cmpl $0x80000001,%eax
     jb pg2m
     movl $0x80000001,%eax
     cpuid
-    btl $26,%edx               /* pdpe1gb? */
+    btl $26,%edx               /* CPUID ext feature: pdpe1gb? */
     jnc pg2m
 pg1g:
-    movq topaddr(%rip),%rax
+    movq topaddr(%rip),%rax    /* --- 1 GiB page variant --- */
     addq $0x3FFFFFFF,%rax
     shrq $30,%rax
-    movq %rax,%r12             /* n 1GiB pages */
+    movq %rax,%r12             /* n 1GiB pages (round up) */
     leaq 511(%rax),%rbx
-    shrq $9,%rbx               /* n PDPT pages = PML4 entries */
-    leaq 1(%rbx),%rcx
-    shlq $9,%rcx
+    shrq $9,%rbx               /* n PDPT pages = n PML4 entries */
+    leaq 1(%rbx),%rcx          /* zero PML4 + all PDPTs: */
+    shlq $9,%rcx               /* (1+npdpt) pages * 512 qwords */
     movl $TBL,%edi
     xorl %eax,%eax
     rep stosq
     xorl %ecx,%ecx
-1:  movq %rcx,%rax
+1:  movq %rcx,%rax             /* PML4[i] -> PDPT page i */
     shlq $12,%rax
-    leaq TBL+0x1003(%rax),%rax
+    leaq TBL+0x1003(%rax),%rax /* +3 = present|rw */
     movq %rax,TBL(,%rcx,8)
     incq %rcx
     cmpq %rbx,%rcx
     jb 1b
     xorl %ecx,%ecx
-2:  movq %rcx,%rax
-    shlq $30,%rax
-    orq $0x83,%rax
+2:  movq %rcx,%rax             /* PDPT entries (contiguous across   */
+    shlq $30,%rax              /* pages): entry i maps phys i*1GiB */
+    orq $0x83,%rax             /* present|rw|PS(1GiB) */
     movq %rax,TBL+0x1000(,%rcx,8)
     incq %rcx
     cmpq %r12,%rcx
     jb 2b
-    leaq 1(%rbx),%rax
+    leaq 1(%rbx),%rax          /* tblend = TBL + (1+npdpt)*4K */
     shlq $12,%rax
     addq $TBL,%rax
     movq %rax,tblend(%rip)
     jmp tbl_ok
 pg2m:
-    movq topaddr(%rip),%rax
+    movq topaddr(%rip),%rax    /* --- 2 MiB page variant --- */
     addq $0x1FFFFF,%rax
     shrq $21,%rax
-    movq %rax,%r12             /* n 2MiB pages */
+    movq %rax,%r12             /* n 2MiB pages (round up) */
     leaq 511(%rax),%r13
     shrq $9,%r13               /* n PD pages */
     leaq 511(%r13),%r14
     shrq $9,%r14               /* n PDPT pages */
-    leaq 1(%r14),%rcx
+    leaq 1(%r14),%rcx          /* zero PML4 + PDPTs + PDs */
     addq %r13,%rcx
     shlq $9,%rcx
     movl $TBL,%edi
     xorl %eax,%eax
     rep stosq
     xorl %ecx,%ecx
-1:  movq %rcx,%rax
+1:  movq %rcx,%rax             /* PML4[i] -> PDPT page i */
     shlq $12,%rax
     leaq TBL+0x1003(%rax),%rax
     movq %rax,TBL(,%rcx,8)
@@ -590,7 +677,7 @@ pg2m:
     shlq $12,%r15
     leaq TBL+0x1000(%r15),%r15
     xorl %ecx,%ecx
-2:  movq %rcx,%rax
+2:  movq %rcx,%rax             /* PDPT[i] -> PD page i */
     shlq $12,%rax
     leaq 3(%r15,%rax),%rax
     movq %rax,TBL+0x1000(,%rcx,8)
@@ -598,22 +685,25 @@ pg2m:
     cmpq %r13,%rcx
     jb 2b
     xorl %ecx,%ecx
-3:  movq %rcx,%rax
+3:  movq %rcx,%rax             /* PD entries: entry i maps i*2MiB */
     shlq $21,%rax
-    orq $0x83,%rax
+    orq $0x83,%rax             /* present|rw|PS(2MiB) */
     movq %rax,(%r15,%rcx,8)
     incq %rcx
     cmpq %r12,%rcx
     jb 3b
-    movq %r13,%rax
+    movq %r13,%rax             /* tblend = PD base + npd*4K */
     shlq $12,%rax
     addq %r15,%rax
     movq %rax,tblend(%rip)
 tbl_ok:
-    movl $TBL,%eax
+    movl $TBL,%eax             /* switch to the full map */
     movq %rax,%cr3
 
-    /* maze region: largest usable region above tables, below map */
+    /* Maze region: scan E820 for the LARGEST usable chunk that lies
+     * above the page tables (2 MiB-rounded, >=4 MiB floor "mazemin")
+     * and below topaddr.  Winner -> mazeb/mazesz.  The maze array, and
+     * the BFS wave buffers of the B key, live here. */
     movq tblend(%rip),%rax
     addq $0x1FFFFF,%rax
     movabsq $0xFFFFFFFFFFE00000,%rdx
@@ -629,21 +719,21 @@ tbl_ok:
 rg_l:
     testl %ecx,%ecx
     jz rg_d
-    cmpl $1,16(%rsi)
+    cmpl $1,16(%rsi)           /* type 1 = usable RAM */
     jne rg_n
-    movq (%rsi),%r8
+    movq (%rsi),%r8            /* r8 = chunk base */
     movq (%rsi),%rax
-    addq 8(%rsi),%rax
-    cmpq topaddr(%rip),%rax
+    addq 8(%rsi),%rax          /* rax = chunk end */
+    cmpq topaddr(%rip),%rax    /* clip end to the mapped range */
     jbe 1f
     movq topaddr(%rip),%rax
-1:  cmpq mazemin(%rip),%r8
+1:  cmpq mazemin(%rip),%r8     /* clip base above the page tables */
     jae 2f
     movq mazemin(%rip),%r8
 2:  cmpq %r8,%rax
     jbe rg_n
-    subq %r8,%rax
-    cmpq %r14,%rax
+    subq %r8,%rax              /* usable length after clipping */
+    cmpq %r14,%rax             /* keep the largest (r14=size r15=base) */
     jbe rg_n
     movq %rax,%r14
     movq %r8,%r15
@@ -654,10 +744,13 @@ rg_n:
 rg_d:
     movq %r14,mazesz(%rip)
     movq %r15,mazeb(%rip)
-    cmpq $1300,%r14
+    cmpq $1300,%r14            /* need at least 2^4*81=1296 B + slack:
+                                * otherwise not even N=3 fits */
     jae 1f
     jmp panic_noram
-1:  movl $2,%ebx               /* maxN: largest n<=2000, n^4<=size */
+1:  movl $2,%ebx               /* maxN: largest n<=2000 with n^4<=size
+                                * (simple increment-and-test; n^4 is
+                                * computed as (n^2)^2) */
 2:  leal 1(%rbx),%eax
     cmpl $2000,%eax
     ja 3f
@@ -670,7 +763,9 @@ rg_d:
     jmp 2b
 3:  movl %ebx,maxN(%rip)
 
-    /* video helpers */
+    /* Video-derived values.  ts = text scale (glyphs are 8x8 pixels
+     * times ts): 1 below 1280x720, 2 below 2560x1440, else 3.
+     * tsl = smaller legend/label scale, gap = spacing between views. */
     movl fbbpp(%rip),%eax
     shrl $3,%eax
     movl %eax,bytespp(%rip)
@@ -698,20 +793,22 @@ rg_d:
     jae 2f
     movl $4,%eax
 2:  movl %eax,gap(%rip)
-    xorl %ecx,%ecx             /* RGB565 table */
+    xorl %ecx,%ecx             /* Precompute the RGB565 palette from
+                                * rgb32[]: 16bpp writes just fetch
+                                * col16[color-index]. */
 c16l:
     leaq rgb32(%rip),%rsi
     movl (%rsi,%rcx,4),%eax
     movl %eax,%edx
-    shrl $19,%edx
+    shrl $19,%edx              /* red 8->5 bits, to bits 11-15 */
     andl $0x1F,%edx
     shll $11,%edx
     movl %eax,%edi
-    shrl $10,%edi
+    shrl $10,%edi              /* green 8->6 bits, to bits 5-10 */
     andl $0x3F,%edi
     shll $5,%edi
     orl %edi,%edx
-    andl $0xFF,%eax
+    andl $0xFF,%eax            /* blue 8->5 bits, to bits 0-4 */
     shrl $3,%eax
     orl %eax,%edx
     leaq col16(%rip),%rdi
@@ -719,7 +816,11 @@ c16l:
     incl %ecx
     cmpl $NCOL,%ecx
     jb c16l
-    cmpl $8,fbbpp(%rip)        /* program DAC palette for 8bpp */
+    cmpl $8,fbbpp(%rip)        /* 8bpp: program the VGA DAC so palette
+                                * index i shows rgb32[i].  Ports: 3C8h =
+                                * start index, then 3x 6-bit R,G,B per
+                                * color on 3C9h (hence the >>2 scaling
+                                * from 8-bit channels). */
     jne dac_d
     xorl %ecx,%ecx
 dacl:
@@ -730,21 +831,29 @@ dacl:
     movl (%rsi,%rcx,4),%edi
     movw $0x3C9,%dx
     movl %edi,%eax
-    shrl $18,%eax
+    shrl $18,%eax              /* red: bits 16-23 -> 6 bit */
     outb %al,%dx
     movl %edi,%eax
-    shrl $10,%eax
+    shrl $10,%eax              /* green: bits 8-15 -> 6 bit */
     andl $0x3F,%eax
     outb %al,%dx
     movl %edi,%eax
-    shrl $2,%eax
+    shrl $2,%eax               /* blue: bits 0-7 -> 6 bit */
     andl $0x3F,%eax
     outb %al,%dx
     incl %ecx
     cmpl $NCOL,%ecx
     jb dacl
 dac_d:
-    /* layout: HUD/legend bands; 2x2 3D grid; 3x2 2D grid */
+    /* Screen layout, computed once per boot (all in pixels):
+     *   hudh = 20*ts+6        top band: title + status line
+     *   lab  = 10*tsl         one label line above each view row
+     *   legh = 30*tsl+6       bottom band: 3 legend lines
+     *   availh = fbh - hudh - legh - 2*lab - 3*gap, halved = max row
+     *   qside  = min((fbw-3*gap)/2, availh/2)   3D view square side
+     *   s2side = min((fbw-4*gap)/3, availh/2)   2D view square side
+     * Both grids are centered horizontally (vx0g/vx1g and v2x0..2)
+     * and stacked under the HUD (yl0/yl1, vy0/vy1 = label/view tops). */
     movl tsl(%rip),%eax
     imull $10,%eax,%ecx
     movl %ecx,lab(%rip)        /* label band = 10*tsl */
@@ -773,7 +882,9 @@ dac_d:
     jbe 1f
     movl %edi,%eax
 1:  movl %eax,qside(%rip)
-    movl fbw(%rip),%edx
+    movl fbw(%rip),%edx        /* center the 2x2 grid: vx0g/vx1g are the
+                                * left/right column x, vy0/vy1 row tops,
+                                * yl0/yl1 label lines above each row */
     movl %eax,%ecx
     shll $1,%ecx
     addl gap(%rip),%ecx
@@ -829,14 +940,15 @@ dac_d:
     movl %edx,y2l1(%rip)
     addl lab(%rip),%edx
     movl %edx,v2y1(%rip)
-    movl tsl(%rip),%eax
+    movl tsl(%rip),%eax        /* legy = top y of the legend band */
     imull $30,%eax,%esi
     addl $6,%esi
     movl fbh(%rip),%edx
     subl %esi,%edx
     addl $2,%edx
     movl %edx,legy(%rip)
-    movl $15,%eax              /* default window: 15 (11 if tiny) */
+    movl $15,%eax              /* default view window: 15 voxels
+                                * (11 when views are tiny) */
     cmpl $160,qside(%rip)
     jae 3f
     movl $11,%eax
@@ -844,6 +956,7 @@ dac_d:
     call seed_rng
     jmp menu
 
+/* Fatal: no usable RAM chunk found - print and halt forever. */
 panic_noram:
     call clear_fb
     movl $16,curx(%rip)
@@ -993,7 +1106,10 @@ mg_d:
     jz menu_epos
     cmpl $2,%eax
     jae 1f
-    movl $2,%eax               /* clamp tiny N up to 2 (see header) */
+    movl $2,%eax               /* clamp tiny N up to 2 (N=1 is a single
+                                * voxel: start == exit, nothing to play;
+                                * N=2 is the smallest with a distinct
+                                * exit thanks to the staircase carve) */
 1:  cmpl maxN(%rip),%eax
     jbe 2f
     movl maxN(%rip),%eax
@@ -1044,9 +1160,11 @@ mt_perf:
     jmp setup_n
 
 /* ---------------- sparse: how many walls to remove ----------------
- * After perfect-maze carving of m^4 cells (m cells per axis) there are
- * 4*m^3*(m-1) walls between adjacent cell pairs, of which m^4-1 were
- * carved, leaving  maxrm = m^3*(3m-4)+1  removable walls. */
+ * "Sparse" post-processing deletes R randomly chosen FULL voxels after
+ * the perfect maze is carved.  Any still-full voxel is fair game (wall
+ * slabs, edges, corners alike), so R can go all the way up to X = the
+ * total number of full voxels left by the carver - choosing R = X turns
+ * the maze into a completely empty N^4 box. */
 menu_walls:
     /* X = removable walls = ALL full voxels of the perfect maze:
      * N^4 - (2m^4 - 1) - (4 if N even), m = ceil(N/2) rooms per axis
@@ -1189,7 +1307,9 @@ setup_n:
     movq %rcx,cells(%rip)
     xorl %ecx,%ecx
 sdl:
-    leaq stride(%rip),%rax
+    leaq stride(%rip),%rax     /* sdtab[dir] = +/- stride[dir>>1]:
+                                * add sdtab[dir] to a voxel address to
+                                * take one step in that direction */
     movq (%rax,%rcx,8),%rdx
     leaq sdtab(%rip),%rax
     movq %rcx,%rdi
@@ -1211,7 +1331,11 @@ sdl:
     movl %eax,ecoord+8(%rip)
     movl %eax,ecoord+12(%rip)
     movq $0,moves(%rip)
-    movl defwin(%rip),%eax     /* per-view windows */
+    movl defwin(%rip),%eax     /* Per-view 3D windows: each view shows a
+                                * vwin^3 cube around the player; forced
+                                * odd so the player sits exactly in the
+                                * middle; capped by N.  maxwinN caps
+                                * zoom-out at odd(min(29,N)). */
     cmpl N(%rip),%eax
     jbe 1f
     movl N(%rip),%eax
@@ -1242,7 +1366,10 @@ sdl:
     movl $41,%eax
 6:  movl %eax,w2def(%rip)
     movl %eax,w2win(%rip)
-    movb $21,vyaw(%rip)
+    movb $21,vyaw(%rip)        /* default rotations for the 4 3D views:
+                                * yaw 21/256 turn (~30 deg), pitch 242 =
+                                * -14/256 turn (~-20 deg) - a classic
+                                * axonometric angle */
     movb $21,vyaw+1(%rip)
     movb $21,vyaw+2(%rip)
     movb $21,vyaw+3(%rip)
@@ -1250,7 +1377,7 @@ sdl:
     movb $242,vpit+1(%rip)
     movb $242,vpit+2(%rip)
     movb $242,vpit+3(%rip)
-    movl $0,actv(%rip)
+    movl $0,actv(%rip)         /* active view = 0 (top-left) */
     call gen_maze
     jmp game_redraw
 
@@ -1326,7 +1453,7 @@ genl:
     xorl %r15d,%r15d           /* candidate count */
     xorl %r13d,%r13d           /* dir */
 gcand:
-    movl %r13d,%eax
+    movl %r13d,%eax            /* neighbor ROOM coord = gcur[axis] +- 2 */
     shrl $1,%eax
     leaq gcur(%rip),%rdx
     movl (%rdx,%rax,4),%edx
@@ -1334,14 +1461,15 @@ gcand:
     andl $1,%eax
     leaq dsgn2(%rip),%rcx
     addl (%rcx,%rax,4),%edx
-    testl %edx,%edx
+    testl %edx,%edx            /* in bounds: 0 <= coord <= maxc */
     js gskip
     cmpl maxc(%rip),%edx
     jg gskip
     leaq sdtab(%rip),%rax
     movq (%rax,%r13,8),%rax
-    leaq (%rbx,%rax,2),%rcx
-    cmpb $1,(%rcx)             /* unvisited cell? */
+    leaq (%rbx,%rax,2),%rcx    /* room address 2 voxel-steps away */
+    cmpb $1,(%rcx)             /* unvisited cell? (visited rooms hold
+                                * 0 or a 0x40-mark, never 1) */
     jne gskip
     leaq cand(%rip),%rax
     movb %r13b,(%rax,%r15)
@@ -1351,8 +1479,8 @@ gskip:
     cmpl $8,%r13d
     jb gcand
     testl %r15d,%r15d
-    jz gback
-    movl %r15d,%edi
+    jz gback                   /* dead end: backtrack via the mark */
+    movl %r15d,%edi            /* pick a random unvisited neighbor */
     call rng_below
     leaq cand(%rip),%rcx
     movzbl (%rcx,%rax),%r13d
@@ -1360,7 +1488,8 @@ gskip:
     movq (%rax,%r13,8),%rdx
     movb $0,(%rbx,%rdx)
     leaq (%rbx,%rdx,2),%rbx
-    movl %r13d,%eax
+    movl %r13d,%eax            /* mark neighbor with the direction back
+                                * (dir^1) so gback can retrace */
     xorl $1,%eax
     addl %eax,%eax
     orl $0x40,%eax             /* came-from dir in bits 1-3 */
@@ -1390,12 +1519,12 @@ gskip:
 gback:
     movzbl (%rbx),%eax
     movb $0,(%rbx)             /* leave cell open */
-    testb $0x10,%al
+    testb $0x10,%al            /* bit4 = start sentinel: DFS finished */
     jnz gdon
-    shrl $1,%eax
+    shrl $1,%eax               /* decode came-from dir from bits 1-3 */
     andl $7,%eax
     movl %eax,%r13d
-    movl %r13d,%eax
+    movl %r13d,%eax            /* step the coord vector back... */
     andl $1,%eax
     leaq dsgn2(%rip),%rcx
     movl (%rcx,%rax,4),%edx
@@ -1403,7 +1532,7 @@ gback:
     shrl $1,%eax
     leaq gcur(%rip),%rcx
     addl %edx,(%rcx,%rax,4)
-    leaq sdtab(%rip),%rax
+    leaq sdtab(%rip),%rax      /* ...and the address, 2 voxels */
     movq (%rax,%r13,8),%rdx
     leaq (%rbx,%rdx,2),%rbx
     jmp genl
@@ -1652,7 +1781,7 @@ game_key:
     jne game_key
     call find_best
 doassist:
-    testl %eax,%eax
+    testl %eax,%eax            /* -1 = no path (can't happen): ignore */
     js game_redraw
     movl %eax,%edi
 domv:
@@ -2108,7 +2237,17 @@ win_scr:
     call getkey
     jmp menu
 
-/* ---------------- renderer ---------------- */
+/* ---------------- renderer ----------------
+ * draw_all repaints the whole frame from scratch (no dirty tracking -
+ * clearing + redrawing is fast enough even at 4K):
+ *   1. HUD: moves, N, active view, player + exit coordinates
+ *   2. legend: 3 lines of key help at the smaller tsl scale (the ts
+ *      global is temporarily swapped to tsl for these draw_str calls)
+ *   3. the views: viewmode 0 = four 3D projections (XYZ, XYW, XZW, YZW
+ *      - each drops one axis), viewmode 1 = six 2D projections (XY, XZ,
+ *      XW, YZ, YW, ZW - each drops two axes).
+ * Views communicate with draw_view/draw_view2 through m_* globals
+ * (m_x0/m_y0 = top-left, cvi = view index). */
 draw_all:
     pushq %rbx
     call clear_fb
@@ -2156,30 +2295,30 @@ draw_all:
     movl $0,cvi(%rip)
     cmpl $0,viewmode(%rip)
     jne d2_v
-da_v:
+da_v:                          /* --- 3D mode: 2x2 grid of views --- */
     movl cvi(%rip),%ebx
-    movl vx0g(%rip),%eax
+    movl vx0g(%rip),%eax       /* column: 0,2 left / 1,3 right */
     testl $1,%ebx
     jz 1f
     movl vx1g(%rip),%eax
 1:  movl %eax,m_x0(%rip)
-    movl vy0(%rip),%eax
+    movl vy0(%rip),%eax        /* row: 0,1 top / 2,3 bottom */
     movl yl0(%rip),%edx
     cmpl $2,%ebx
     jb 2f
     movl vy1(%rip),%eax
     movl yl1(%rip),%edx
 2:  movl %eax,m_y0(%rip)
-    movl m_x0(%rip),%eax
-    movl %eax,curx(%rip)
-    movl %edx,cury(%rip)
+    movl m_x0(%rip),%eax       /* label line above the view; the   */
+    movl %eax,curx(%rip)       /* active view gets accent color +  */
+    movl %edx,cury(%rip)       /* an "*ACTIVE*" suffix             */
     movl $ID_DIM,colr(%rip)
     cmpl actv(%rip),%ebx
     jne 3f
     movl $ID_ACC,colr(%rip)
 3:  leaq s_vlab(%rip),%rsi
     movl %ebx,%eax
-    shll $2,%eax
+    shll $2,%eax               /* labels are 4 bytes apart ("XYZ\0") */
     addq %rax,%rsi
     call draw_str
     cmpl actv(%rip),%ebx
@@ -2204,7 +2343,10 @@ da_done:
     popq %rbx
     ret
 
-/* 2D mode: 6 panels XY XZ XW YZ YW ZW in 3x2 grid */
+/* 2D mode: 6 panels XY XZ XW YZ YW ZW in a 3x2 grid.  Same pattern as
+ * da_v: compute the panel's top-left from its grid cell, draw label +
+ * border, then the panel body (draw_view2).  2D panels have no "active"
+ * highlight - rotation/zoom keys act on the shared 2D window instead. */
 d2_v:
     movl cvi(%rip),%ebx
     movl %ebx,%ecx             /* col = cvi%3, row = cvi/3 */
@@ -2242,7 +2384,9 @@ d2_v:
     jb d2_v
     jmp da_done
 
-/* frame around (m_x0-2,m_y0-2), inner side brd, thickness 2, color m_bc */
+/* frame around (m_x0-2,m_y0-2), inner side brd, thickness 2, color m_bc
+ * (four fill_rect strips: top, bottom, left, right - the last one is a
+ * tail call) */
 draw_border:
     movl m_x0(%rip),%edi
     subl $2,%edi
@@ -2277,7 +2421,15 @@ draw_border:
     movl m_bc(%rip),%r8d
     jmp fill_rect
 
-/* one 3D view: axes from axtab, angles/window per view */
+/* one 3D view: renders the vwin^3 cube of maze around the player as an
+ * axonometric dot cloud.  View cvi shows the 3 axes of axtab[cvi] (the
+ * 4th is held fixed at the player's coordinate - that's how a 4D volume
+ * becomes four 3D slices).  Setup below precomputes, into m_* globals:
+ * sin/cos of that view's yaw and pitch, the projection scale m_pp, the
+ * depth-shading parameters, the per-depth dot sizes, the voxel strides
+ * of the 3 shown axes, and the per-axis clip ranges (window clamped to
+ * the maze box).  Then it draws: axis gizmo, all open voxels, exit and
+ * start markers if their slice matches, and the player at the center. */
 draw_view:
     pushq %rbx
     pushq %rbp
@@ -2285,7 +2437,8 @@ draw_view:
     pushq %r13
     pushq %r14
     pushq %r15
-    movl cvi(%rip),%eax
+    movl cvi(%rip),%eax        /* m_ax[0..3] = axtab row: the 3 shown
+                                * axes + the fixed one (0=X 1=Y 2=Z 3=W) */
     leaq axtab(%rip),%rcx
     movzbl (%rcx,%rax,4),%edx
     movl %edx,m_ax(%rip)
@@ -2295,7 +2448,8 @@ draw_view:
     movl %edx,m_ax+8(%rip)
     movzbl 3(%rcx,%rax,4),%edx
     movl %edx,m_ax+12(%rip)
-    leaq vyaw(%rip),%rcx
+    leaq vyaw(%rip),%rcx       /* sin/cos of yaw and pitch: sinv(a) and
+                                * sinv(a+64) (a quarter turn = cosine) */
     movzbl (%rcx,%rax),%edi
     movl %edi,%r12d
     call sinv
@@ -2315,10 +2469,13 @@ draw_view:
     movl cvi(%rip),%eax
     leaq vwin(%rip),%rcx
     movl (%rcx,%rax,4),%eax
-    movl %eax,m_v(%rip)
+    movl %eax,m_v(%rip)        /* V = window (odd), h = V/2 = reach */
     shrl $1,%eax
     movl %eax,m_h(%rip)
-    movl qside(%rip),%eax      /* pp = Q*45/(64*V) */
+    movl qside(%rip),%eax      /* pp = pixels per voxel step.  Q*45/
+                                * (64*V) ~= Q/(1.42*V): the whole
+                                * rotated cube (diagonal sqrt(2)) fits
+                                * in the Q-pixel square at any yaw */
     imull $45,%eax
     movl m_v(%rip),%ecx
     shll $6,%ecx
@@ -2328,7 +2485,7 @@ draw_view:
     jnz 1f
     movl $1,%eax
 1:  movl %eax,m_pp(%rip)
-    movl qside(%rip),%edx
+    movl qside(%rip),%edx      /* view center in screen pixels */
     shrl $1,%edx
     movl m_x0(%rip),%eax
     addl %edx,%eax
@@ -2336,13 +2493,18 @@ draw_view:
     movl m_y0(%rip),%eax
     addl %edx,%eax
     movl %eax,m_cy2(%rip)
-    movl m_h(%rip),%eax        /* depth band scale */
+    movl m_h(%rip),%eax        /* depth shading: rotated depth z2 spans
+                                * about +-h*1.73*16384; zbias = h*28400
+                                * ~= that bound, zdiv = 2*zbias+1, so
+                                * (z2+zbias)*4/zdiv lands in band 0..3
+                                * (0 = nearest = brightest gray) */
     imull $28400,%eax
     movslq %eax,%rax
     movq %rax,m_zbias(%rip)
     leaq 1(%rax,%rax),%rax
     movq %rax,m_zdiv(%rip)
-    movl m_pp(%rip),%eax       /* dot sizes per band */
+    movl m_pp(%rip),%eax       /* dot sizes per band: pp/2 shrinking by
+                                * 1 per band, floor 1 pixel */
     shrl $1,%eax
     xorl %ecx,%ecx
 2:  movl %eax,%edx
@@ -2355,7 +2517,7 @@ draw_view:
     incl %ecx
     cmpl $4,%ecx
     jb 2b
-    movl m_pp(%rip),%eax
+    movl m_pp(%rip),%eax       /* gizmo dot size = pp/3, floor 1 */
     xorl %edx,%edx
     movl $3,%ecx
     divl %ecx
@@ -2363,7 +2525,7 @@ draw_view:
     jnz 4f
     movl $1,%eax
 4:  movl %eax,m_asz(%rip)
-    movl m_pp(%rip),%eax
+    movl m_pp(%rip),%eax       /* marker size = pp+1, floor 3 */
     incl %eax
     cmpl $3,%eax
     jge 5f
@@ -2379,7 +2541,9 @@ draw_view:
     movl m_ax+8(%rip),%eax
     movq (%rcx,%rax,8),%rdx
     movq %rdx,m_sC(%rip)
-    xorl %ecx,%ecx             /* clip ranges per view axis */
+    xorl %ecx,%ecx             /* clip ranges per view axis: relative
+                                * offsets [-h..h] intersected with the
+                                * maze box [0..N-1] around the player */
 rg2:
     leaq m_ax(%rip),%rax
     movl (%rax,%rcx,4),%eax
@@ -2409,7 +2573,11 @@ rg2:
     leaq pcoord(%rip),%rsi
     call vox_addr_v
     movq %rax,m_pa(%rip)
-    xorl %r12d,%r12d           /* axis gizmo */
+    xorl %r12d,%r12d           /* Axis gizmo: a dotted ray of small dots
+                                * along +1..+h of each of the 3 shown
+                                * axes, colored per 4D axis (ID_AX+axis)
+                                * so the player can tell which world
+                                * direction each view direction is. */
 gz_k:
     movl $1,%r13d
 gz_t:
@@ -2440,7 +2608,15 @@ gz_n:
     incl %r12d
     cmpl $3,%r12d
     jb gz_k
-    movl m_lo(%rip),%r12d      /* voxel dots */
+    movl m_lo(%rip),%r12d      /* Voxel dots: triple loop over the clip
+                                * ranges of the 3 shown axes.  Voxel
+                                * addresses are kept incrementally
+                                * (base + coord*stride per level), so
+                                * the inner loop is one add.  Only OPEN
+                                * voxels (bit0 = 0) are drawn - walls
+                                * are the invisible filler.  This also
+                                * ignores search-mark bits 0x40/0x10,
+                                * so a cached H/B tree never shows. */
 vlA:
     cmpl m_hi(%rip),%r12d
     jg vmark
@@ -2466,13 +2642,13 @@ vlC:
     movzbl 0(%rbp),%eax
     testb $1,%al
     jnz vsk
-    movslq %r12d,%rcx
+    movslq %r12d,%rcx          /* project rel (rcx,rdx,rbx)... */
     movslq %r13d,%rdx
     movslq %r14d,%rbx
     call xform
-    movl %edi,%r8d
-    addl $ID_G0,%r8d
-    leaq m_dsz(%rip),%rdx
+    movl %edi,%r8d             /* ...and shade by depth band: gray */
+    addl $ID_G0,%r8d           /* ID_G0+0 near .. ID_G0+3 far, dot  */
+    leaq m_dsz(%rip),%rdx      /* size shrinking with the band      */
     movzbl (%rdx,%rdi),%edx
     call dot_draw
 vsk:
@@ -2486,13 +2662,13 @@ vBe:
     incl %r12d
     jmp vlA
 vmark:
-    leaq ecoord(%rip),%rsi
+    leaq ecoord(%rip),%rsi     /* exit and start markers (if in slice) */
     movl $ID_EXIT,%r8d
     call mark_draw
     leaq svec(%rip),%rsi
     movl $ID_START,%r8d
     call mark_draw
-    xorl %ecx,%ecx
+    xorl %ecx,%ecx             /* player = rel (0,0,0), view center */
     xorl %edx,%edx
     xorl %ebx,%ebx
     call xform
@@ -2507,7 +2683,12 @@ vmark:
     popq %rbx
     ret
 
-mark_draw:                     /* rsi=coords, r8d=color id */
+mark_draw:                     /* rsi=coords, r8d=color id.  Draw the
+                                * exit/start marker in a 3D view - only
+                                * when its FIXED-axis coordinate equals
+                                * the player's (i.e. it lies in this
+                                * 3D slice) and the other three fall
+                                * inside the clip window. */
     movl %r8d,m_mid(%rip)
     movq %rsi,m_mt(%rip)
     movl m_ax+12(%rip),%eax    /* fixed axis must match player */
@@ -2517,8 +2698,8 @@ mark_draw:                     /* rsi=coords, r8d=color id */
     cmpl (%rsi,%rax,4),%edx
     jne md_no
     xorl %ecx,%ecx
-1:  leaq m_ax(%rip),%rax
-    movl (%rax,%rcx,4),%eax
+1:  leaq m_ax(%rip),%rax       /* rel coords on the 3 shown axes,   */
+    movl (%rax,%rcx,4),%eax    /* rejected if outside [-h..h]       */
     movq m_mt(%rip),%rsi
     movl (%rsi,%rax,4),%edx
     leaq pcoord(%rip),%rsi
@@ -2546,7 +2727,12 @@ mark_draw:                     /* rsi=coords, r8d=color id */
 md_no:
     ret
 
-/* one 2D panel: plane m_ax[0],m_ax[1]; other axes fixed at player */
+/* one 2D panel: an orthogonal top-down map of the plane spanned by
+ * m_ax[0] and m_ax[1]; the other two axes are fixed at the player's
+ * position.  The window auto-fits: cell pitch cp = s2side/vismax where
+ * vismax is the larger visible extent, so the panel is always filled.
+ * Walls are dark cells, open voxels light, then exit/start markers
+ * (only if BOTH fixed axes match - see mark2) and the player. */
 draw_view2:
     pushq %rbx
     pushq %rbp
@@ -2719,7 +2905,11 @@ v2mk:
     popq %rbx
     ret
 
-mark2:                         /* rsi=coords, r8d=color: 2D marker */
+mark2:                         /* rsi=coords, r8d=color: 2D marker.
+                                * Drawn only when the marker's TWO fixed
+                                * axes equal the player's (it lies in
+                                * this 2D slice) and its plane coords
+                                * fall inside the visible clip range. */
     movl %r8d,m_mid(%rip)
     movq %rsi,m_mt(%rip)
     movl m_ax+8(%rip),%eax     /* both fixed axes must match */
@@ -2761,7 +2951,18 @@ mk2_no:
     ret
 
 /* rotate+project cell offset: in rcx=dx rdx=dy rbx=dz
- * out eax=sx esi=sy edi=depth band 0-3; clobbers rdx,r8-r11 */
+ * out eax=sx esi=sy edi=depth band 0-3; clobbers rdx,r8-r11
+ *
+ * Standard yaw-then-pitch rotation in 2.14 fixed point (sin/cos are
+ * +-16383 from sinv, products are >>14 to renormalize):
+ *   x1 =  dx*cos(yaw) + dz*sin(yaw)      (rotate around vertical)
+ *   z1 =  dz*cos(yaw) - dx*sin(yaw)
+ *   y2 =  dy*cos(pit) - z1*sin(pit)      (tilt around horizontal)
+ *   z2 =  z1*cos(pit) + dy*sin(pit)      (depth toward the viewer)
+ * screen = view center + (x1*pp>>14, y2*pp>>14); depth band =
+ * clamp((z2+zbias)*4/zdiv, 0..3) - see draw_view for zbias/zdiv.
+ * x1/z1 are kept <<14 (not renormalized) until the final projection
+ * multiply, keeping full precision through the second rotation. */
 xform:
     movslq m_cy(%rip),%rax
     imulq %rcx,%rax
@@ -2787,7 +2988,7 @@ xform:
     movslq m_sp(%rip),%r11
     imulq %rdx,%r11
     addq %r11,%r8              /* z2<<14 */
-    addq m_zbias(%rip),%r8
+    addq m_zbias(%rip),%r8     /* shift to >=0, then scale to 0..3 */
     jns 1f
     xorl %r8d,%r8d
 1:  shlq $2,%r8
@@ -2798,7 +2999,7 @@ xform:
     jbe 2f
     movl $3,%eax
 2:  movl %eax,%edi
-    movslq m_pp(%rip),%r11
+    movslq m_pp(%rip),%r11     /* screen x/y: scale by pp, recenter */
     movq %r10,%rax
     imulq %r11,%rax
     sarq $14,%rax
@@ -2809,7 +3010,8 @@ xform:
     addl m_cy2(%rip),%esi
     ret
 
-/* centered square dot, clipped to view box
+/* centered square dot, clipped to view box (never bleeds into HUD or
+ * a neighboring view; fully outside = not drawn at all)
  * eax=sx esi=sy edx=size r8d=color */
 dot_draw:
     movl %edx,%r9d
@@ -2839,7 +3041,12 @@ dot_draw:
 
 /* ---------------- primitives ---------------- */
 /* edi=x esi=y edx=w ecx=h r8d=color id; preserves rbx,rbp,r12-r15
- * clips to the framebuffer, safe for any mode geometry */
+ * clips to the framebuffer, safe for any mode geometry.
+ * One row loop per pixel format: 8bpp writes the palette index itself
+ * (rep stosb), 16bpp the precomputed RGB565 word (rep stosw), 32bpp the
+ * rgb32 dword (rep stosl); 24bpp has no string op so it stores word +
+ * byte per pixel by hand.  Row start advances by fbpitch (which may
+ * exceed width*bytespp). */
 fill_rect:
     testl %edi,%edi            /* x<0: shrink w, clamp x */
     jns 1f
@@ -2940,7 +3147,10 @@ clear_fb:
     movl $ID_BG,%r8d
     jmp fill_rect
 
-/* al=char at (curx,cury), color colr, advances curx; keeps rsi */
+/* al=char at (curx,cury), color colr, advances curx; keeps rsi.
+ * Glyphs are the 8x8 BIOS font copied to FONT by stage2 (128 glyphs,
+ * hence the 0x7F mask); each set bit becomes a ts x ts fill_rect, so
+ * text scales with the resolution-dependent ts. */
 draw_char:
     pushq %rbx
     pushq %rbp
@@ -3024,7 +3234,7 @@ draw_vec4:                     /* rsi -> 4 dwords "a,b,c,d" */
     popq %rbx
     ret
 
-menu_nl:
+menu_nl:                       /* newline: cury += 10*ts, curx = 16 */
     movl ts(%rip),%eax
     leal (%rax,%rax,4),%eax
     addl %eax,%eax
@@ -3032,7 +3242,9 @@ menu_nl:
     movl $16,curx(%rip)
     ret
 
-itoa:                          /* rax -> rsi=asciz in numbuf */
+itoa:                          /* rax -> rsi=asciz in numbuf (builds
+                                * the decimal string backwards from
+                                * the end of the buffer) */
     leaq numbuf+23(%rip),%rsi
     movb $0,(%rsi)
     movl $10,%ecx
@@ -3045,7 +3257,15 @@ itoa:                          /* rax -> rsi=asciz in numbuf */
     jnz 1b
     ret
 
-getkey:                        /* poll PS/2, return make scancode */
+getkey:                        /* Poll PS/2, return a make scancode.
+                                * Status port 0x64 bit0 = data ready,
+                                * bit5 = it's from the mouse (discard).
+                                * E0/E1 prefixes are skipped (extended
+                                * arrows then deliver their base code)
+                                * and break codes (bit7) are ignored,
+                                * so this returns exactly one byte per
+                                * key PRESS.  Blocks; HLT is pointless
+                                * here since interrupts are off. */
 1:  inb $0x64,%al
     testb $1,%al
     jz 1b
@@ -3062,7 +3282,10 @@ getkey:                        /* poll PS/2, return make scancode */
     jnz 1b
     ret
 
-seed_rng:
+seed_rng:                      /* seed = TSC ^ PIT counter ^ RTC secs
+                                * (three independent clocks; 0 falls
+                                * back to a fixed nonzero constant
+                                * because xorshift can't leave 0) */
     rdtsc
     movl %eax,%ecx
     xorl %edx,%ecx
@@ -3085,7 +3308,8 @@ seed_rng:
 1:  movl %ecx,rngs(%rip)
     ret
 
-rng_next:                      /* xorshift32 -> eax */
+rng_next:                      /* xorshift32 -> eax (period 2^32-1);
+                                * clobbers ecx */
     movl rngs(%rip),%eax
     movl %eax,%ecx
     shll $13,%ecx
@@ -3099,14 +3323,16 @@ rng_next:                      /* xorshift32 -> eax */
     movl %eax,rngs(%rip)
     ret
 
-rng_below:                     /* eax = rng % edi */
+rng_below:                     /* eax = rng % edi; clobbers ecx,edx */
     call rng_next
     xorl %edx,%edx
     divl %edi
     movl %edx,%eax
     ret
 
-vox_addr_v:                    /* rsi -> x,y,z,w dwords; rax = addr */
+vox_addr_v:                    /* rsi -> x,y,z,w dwords; rax = addr.
+                                * Horner form of mazeb + x + N*(y +
+                                * N*(z + N*w)); clobbers rdx. */
     movslq 12(%rsi),%rax
     imulq Nq(%rip),%rax
     movslq 8(%rsi),%rdx
@@ -3120,18 +3346,22 @@ vox_addr_v:                    /* rsi -> x,y,z,w dwords; rax = addr */
     addq mazeb(%rip),%rax
     ret
 
-sinv:                          /* edi=angle 0-255 -> eax=sin*16383 */
+sinv:                          /* edi=angle 0-255 -> eax=sin*16383
+                                * (sinv(a+64) gives the cosine) */
     andl $255,%edi
     leaq sintab(%rip),%rax
     movswl (%rax,%rdi,2),%eax
     ret
 
 /* ---------------- data ---------------- */
+/* axtab[view] = the 3 shown axes + the fixed axis of each 3D view;
+ * ax2tab[panel] = the 2 plane axes + the 2 fixed axes of each 2D panel
+ * (0=X 1=Y 2=Z 3=W) */
 axtab:  .byte 0,1,2,3, 0,1,3,2, 0,2,3,1, 1,2,3,0
 ax2tab: .byte 0,1,2,3, 0,2,1,3, 0,3,1,2, 1,2,0,3, 1,3,0,2, 2,3,0,1
-dsgn2:  .long 2,-2
-dsgn1:  .long 1,-1
-scan2dig: .ascii "1234567890"
+dsgn2:  .long 2,-2             /* room-lattice step per dir parity */
+dsgn1:  .long 1,-1             /* voxel step per dir parity */
+scan2dig: .ascii "1234567890"  /* scancodes 0x02..0x0B -> ASCII */
 s_vlab: .asciz "XYZ"
         .asciz "XYW"
         .asciz "XZW"
@@ -3180,8 +3410,13 @@ s_w3:   .asciz "PRESS ANY KEY FOR MENU"
 s_noram:.asciz "NO USABLE RAM FOUND"
 
     .p2align 3
-c_ang:  .double 0.02454369260617026
-c_amp:  .double 16383.0
+c_ang:  .double 0.02454369260617026  /* 2*pi/256: angle byte -> radians */
+c_amp:  .double 16383.0              /* 2.14 fixed point amplitude */
+/* palette, indexed by the ID_* color ids (see top of file):
+ *   0 ID_BG black | 1-4 ID_G0.. depth grays near->far | 5 ID_PLY yellow
+ *   6 ID_EXIT green | 7 ID_START blue | 8-11 ID_AX+X/Y/Z/W axis colors
+ *   (orange/cyan/purple/white) | 12 ID_TXT | 13 ID_DIM | 14 ID_ACC
+ *   gold | 15 ID_ERR red | 16 ID_BORD | 17 ID_BAR light blue */
 rgb32:
     .long 0x000000
     .long 0xF8F8F8, 0xB8B8B8, 0x808080, 0x505050
@@ -3191,133 +3426,135 @@ rgb32:
     .long 0x505050, 0x00C0FF
 
     .p2align 3
-topaddr: .quad 0
-tblend:  .quad 0
-mazemin: .quad 0
-mazeb:   .quad 0
-mazesz:  .quad 0
-Nq:      .quad 0
-total:   .quad 0
-cells:   .quad 0
-moves:   .quad 0
-gdone:   .quad 0
-rmwalls: .quad 0
-maxrm:   .quad 0
-wvA:     .quad 0
-wvB:     .quad 0
-wvcap:   .quad 0
-wcur:    .quad 0
-wnxt:    .quad 0
-freevox: .quad 0
-svis:    .quad 0
-stride:  .quad 0,0,0,0
-sdtab:   .quad 0,0,0,0,0,0,0,0
-m_pa:    .quad 0
-m_aA:    .quad 0
-m_sA:    .quad 0
+topaddr: .quad 0               /* top of the identity-mapped range */
+tblend:  .quad 0               /* first byte after the page tables */
+mazemin: .quad 0               /* lowest address the maze may use */
+mazeb:   .quad 0               /* maze array base (largest E820 chunk) */
+mazesz:  .quad 0               /* size of that chunk in bytes */
+Nq:      .quad 0               /* N as a qword (for imulq) */
+total:   .quad 0               /* N^4 = voxel count */
+cells:   .quad 0               /* m^4 = room count */
+moves:   .quad 0               /* the score */
+gdone:   .quad 0               /* generator: rooms carved so far */
+rmwalls: .quad 0               /* sparse: R walls to remove (0=perfect) */
+maxrm:   .quad 0               /* sparse: X = removable (full) voxels */
+wvA:     .quad 0               /* BFS: current wave buffer */
+wvB:     .quad 0               /* BFS: next wave buffer */
+wvcap:   .quad 0               /* BFS: bytes per wave buffer */
+wcur:    .quad 0               /* BFS: entries in current wave */
+wnxt:    .quad 0               /* BFS: entries in next wave */
+freevox: .quad 0               /* open voxels (search bar denominator) */
+svis:    .quad 0               /* search progress counter */
+stride:  .quad 0,0,0,0         /* voxel index step per axis: 1,N,N^2,N^3 */
+sdtab:   .quad 0,0,0,0,0,0,0,0 /* address step per dir: +-stride[d>>1] */
+m_pa:    .quad 0               /* renderer: player voxel address */
+m_aA:    .quad 0               /* renderer: partial address, outer loop */
+m_sA:    .quad 0               /* renderer: strides of the shown axes */
 m_sB:    .quad 0
 m_sC:    .quad 0
-m_zbias: .quad 0
-m_zdiv:  .quad 0
-m_mt:    .quad 0
-errstr:  .quad 0
-fbphys:  .long 0
-fbpitch: .long 0
-fbw:     .long 0
+m_zbias: .quad 0               /* depth shading: shift z2 nonnegative */
+m_zdiv:  .quad 0               /* depth shading: band divisor */
+m_mt:    .quad 0               /* marker coords ptr (mark_draw/mark2) */
+errstr:  .quad 0               /* menu error line (0 = none) */
+fbphys:  .long 0               /* framebuffer: physical base, */
+fbpitch: .long 0               /* bytes per scanline,         */
+fbw:     .long 0               /* width px, height px, bits   */
 fbh:     .long 0
 fbbpp:   .long 0
-bestsc:  .long 0
-bestlim: .long 0
-bestmd:  .word 0
-curmd:   .word 0
-mcnt:    .word 0
+bestsc:  .long 0               /* VBE scan: best score so far */
+bestlim: .long 0               /* VBE scan: scores >= this failed */
+bestmd:  .word 0               /* VBE scan: best mode number */
+curmd:   .word 0               /* VBE scan: mode being probed */
+mcnt:    .word 0               /* VBE scan: modes left (cap) */
          .word 0
-N:       .long 0
-maxc:    .long 0
-maxN:    .long 0
-ts:      .long 1
-tsl:     .long 1
-tsav:    .long 1
-gap:     .long 8
-bytespp: .long 4
-qside:   .long 0
-vx0g:    .long 0
+N:       .long 0               /* maze side; everything derives from it */
+maxc:    .long 0               /* largest room coord = 2*(m-1) */
+maxN:    .long 0               /* largest N that fits in RAM (<=2000) */
+ts:      .long 1               /* text scale (glyph = 8*ts px) */
+tsl:     .long 1               /* legend/label text scale */
+tsav:    .long 1               /* saved ts during legend drawing */
+gap:     .long 8               /* px between views */
+bytespp: .long 4               /* framebuffer bytes per pixel */
+qside:   .long 0               /* 3D view square side px */
+vx0g:    .long 0               /* 3D grid: left/right column x */
 vx1g:    .long 0
-vy0:     .long 0
+vy0:     .long 0               /* 3D grid: top/bottom row y */
 vy1:     .long 0
-yl0:     .long 0
+yl0:     .long 0               /* 3D grid: label line y per row */
 yl1:     .long 0
-legy:    .long 0
-lab:     .long 0
-hudh:    .long 0
-s2side:  .long 0
-v2x0:    .long 0
+legy:    .long 0               /* legend band top y */
+lab:     .long 0               /* label line height */
+hudh:    .long 0               /* HUD band height */
+s2side:  .long 0               /* 2D panel square side px */
+v2x0:    .long 0               /* 2D grid: the 3 column x */
 v2x1:    .long 0
 v2x2:    .long 0
-y2l0:    .long 0
+y2l0:    .long 0               /* 2D grid: label line y per row */
 y2l1:    .long 0
-v2y0:    .long 0
+v2y0:    .long 0               /* 2D grid: the 2 row y */
 v2y1:    .long 0
-viewmode:.long 0
-w2win:   .long 41
-w2max:   .long 41
-w2def:   .long 41
-m2_w:    .long 0
-m2_cp:   .long 0
-m2_sz:   .long 0
-m2_gx:   .long 0
+viewmode:.long 0               /* 0 = four 3D views, 1 = six 2D panels */
+w2win:   .long 41              /* 2D window (voxels shown per axis) */
+w2max:   .long 41              /* its zoom-out cap = odd(2N-1)<=401 */
+w2def:   .long 41              /* its default = min(41,w2max) */
+m2_w:    .long 0               /* draw_view2: effective window */
+m2_cp:   .long 0               /* draw_view2: cell pitch px */
+m2_sz:   .long 0               /* draw_view2: filled cell size px */
+m2_gx:   .long 0               /* draw_view2: px of relative (0,0) */
 m2_gy:   .long 0
-m2_px:   .long 0
-brd:     .long 0
-defwin:  .long 15
-defwinN: .long 15
-maxwinN: .long 29
-actv:    .long 0
-cvi:     .long 0
-curx:    .long 0
+m2_px:   .long 0               /* draw_view2: current column px */
+brd:     .long 0               /* draw_border: inner side length */
+defwin:  .long 15              /* 3D window default (from resolution) */
+defwinN: .long 15              /* ... clamped to odd(min(defwin,N)) */
+maxwinN: .long 29              /* 3D window zoom-out cap, odd(<=N) */
+actv:    .long 0               /* active 3D view 0..3 (rot/zoom keys) */
+cvi:     .long 0               /* view being drawn right now */
+curx:    .long 0               /* text cursor px */
 cury:    .long 0
-colr:    .long 12
-inlen:   .long 0
-rngs:    .long 0x12345
-pcoord:  .long 0,0,0,0
-ecoord:  .long 0,0,0,0
-tvec:    .long 0,0,0,0
-hvec:    .long 0,0,0,0
-gcur:    .long 0,0,0,0
-svec:    .long 0,0,0,0
-vwin:    .long 15,15,15,15
-m_ax:    .long 0,0,0,0
-m_lo:    .long 0,0,0
+colr:    .long 12              /* text color id */
+inlen:   .long 0               /* menu input: digits entered */
+rngs:    .long 0x12345         /* xorshift32 state */
+pcoord:  .long 0,0,0,0         /* player x,y,z,w */
+ecoord:  .long 0,0,0,0         /* exit = (N-1,N-1,N-1,N-1) */
+tvec:    .long 0,0,0,0         /* try_move scratch destination */
+hvec:    .long 0,0,0,0         /* find_opt DFS cursor */
+gcur:    .long 0,0,0,0         /* generator DFS cursor (room coords) */
+svec:    .long 0,0,0,0         /* start marker coords (all 0) */
+vwin:    .long 15,15,15,15     /* 3D window per view */
+m_ax:    .long 0,0,0,0         /* current view's axis mapping */
+m_lo:    .long 0,0,0           /* clip range lo/hi per view axis */
 m_hi:    .long 0,0,0
-m_rel:   .long 0,0,0
-m_v:     .long 0
+m_rel:   .long 0,0,0           /* marker coords relative to player */
+m_v:     .long 0               /* window V (odd) and h = V/2 */
 m_h:     .long 0
-m_pp:    .long 0
-m_cx:    .long 0
+m_pp:    .long 0               /* projection: pixels per voxel step */
+m_cx:    .long 0               /* view center px */
 m_cy2:   .long 0
-m_x0:    .long 0
+m_x0:    .long 0               /* current view top-left px */
 m_y0:    .long 0
-m_sy:    .long 0
+m_sy:    .long 0               /* sin/cos yaw, sin/cos pitch (2.14) */
 m_cy:    .long 0
 m_sp:    .long 0
 m_cp:    .long 0
-m_asz:   .long 0
-m_msz:   .long 0
-m_mid:   .long 0
-m_bc:    .long 0
-barx:    .long 0
+m_asz:   .long 0               /* gizmo dot size px */
+m_msz:   .long 0               /* marker/player dot size px */
+m_mid:   .long 0               /* marker color id */
+m_bc:    .long 0               /* border color id */
+barx:    .long 0               /* progress bar geometry px */
 bary:    .long 0
 barw:    .long 0
 barh:    .long 0
-optok:   .long 0
-bestok:  .long 0
-vyaw:    .byte 21,21,21,21
-vpit:    .byte 242,242,242,242
-m_dsz:   .byte 0,0,0,0
-cand:    .byte 0,0,0,0,0,0,0,0
-inbuf:   .byte 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
-tmpw:    .word 0
-numbuf:  .skip 24
-sintab:  .skip 512
-col16:   .skip 36
+optok:   .long 0               /* 1 = voxel marks hold a cached DFS/BFS
+                                * came-from tree (H answers instantly) */
+bestok:  .long 0               /* 1 = that tree is the BFS shortest-path
+                                * tree (B answers instantly too) */
+vyaw:    .byte 21,21,21,21     /* per-view yaw angle bytes */
+vpit:    .byte 242,242,242,242 /* per-view pitch angle bytes */
+m_dsz:   .byte 0,0,0,0         /* dot size per depth band */
+cand:    .byte 0,0,0,0,0,0,0,0 /* candidate dirs (gen/rnd_move) */
+inbuf:   .byte 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0 /* menu digits */
+tmpw:    .word 0               /* x87 int load scratch */
+numbuf:  .skip 24              /* itoa output buffer */
+sintab:  .skip 512             /* 256 x int16 sine table (built at boot) */
+col16:   .skip 36              /* RGB565 palette (derived from rgb32) */
 imgend:

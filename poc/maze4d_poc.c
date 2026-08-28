@@ -12,6 +12,9 @@
  *   - xorshift32 RNG
  * Adds a BFS check (every room reachable => perfect maze) and an
  * interactive text walker on the 4 hyperplane slices.
+ * (The game's H/B assist searches and their in-place mark caching are
+ * game-only and not mirrored here - this PoC validates representation,
+ * generation, sparse removal and reachability.)
  *
  * build: cc -O2 -o maze4d_poc maze4d_poc.c
  * usage: ./maze4d_poc N [seed] [rmwalls]   (N >= 2; rmwalls = sparse maze)

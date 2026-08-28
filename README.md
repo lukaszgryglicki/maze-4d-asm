@@ -54,6 +54,41 @@ friendlier to actually solve by hand).
      (1 byte per voxel) and derives **MAX N** from it: the largest N with N⁴
      bytes fitting (capped at 2000 → 16 TB).
 
+### Physical memory map
+
+Everything lives at fixed low addresses plus one dynamically chosen region:
+
+| address | contents |
+|---------|----------|
+| `0x05000` | E820 memory map (count word, 24-byte entries from `+0x10`, ≤ 32) |
+| `0x05800` | VBE controller info block ("VBE2"/"VESA") |
+| `0x05900` | VBE per-mode info block (reused for each probed mode) |
+| `0x07C00` | this image: boot sector + up to 62 more sectors (≤ 32256 B) |
+| `0x10000` | bootstrap page tables (PML4+PDPT+4 PD = first 4 GiB, 2 MiB pages) |
+| `0x70000` | copy of the BIOS 8×8 font (first 128 glyphs, 1 KiB) |
+| `0x90000` | 64-bit stack top (grows down) |
+| `0x100000` | final page tables (PML4, then PDPTs, then PDs as needed) |
+| *largest free E820 chunk* | **the maze**: N⁴ voxel bytes at `mazeb`; the rest of the chunk is scratch for B's two BFS wave buffers |
+
+### Voxel encoding
+
+The whole maze is one flat array of N⁴ bytes (index `x + N·y + N²·z + N³·w`).
+Each byte encodes:
+
+| bits | meaning |
+|------|---------|
+| bit 0 | `1` = wall, `0` = open — the **only** bit gameplay and rendering test |
+| bits 1–3 | came-from direction of a search/generator mark |
+| bit 6 | "visited" flag of such a mark (`0x40 \| dir<<1`) |
+| bit 4 | root sentinel (`0x50`): DFS/BFS start room (generator: maze start; searches: the exit) |
+
+The generator erases its marks while backtracking; the H/B search marks are
+deliberately **left in place** as a cached exit-rooted spanning tree (see the
+H/B section below). `sweep_marks` clears everything but bit 0 when a stale
+tree must be replaced. Directions are numbered `0..7 = +x,−x,+y,−y,+z,−z,+w,−w`
+with `axis = dir>>1`, `sign = dir&1`, `opposite = dir^1` — a numbering that
+makes bounds checks, mark encoding and table lookups all one instruction each.
+
 ### Maze generation
 
 Perfect maze (every room reachable, exactly one path between any two rooms) via
@@ -137,6 +172,32 @@ light cells = open, dark = walls, yellow = you, green = exit, blue = start
 3D mode). The visible window auto-fits: the grid is scaled and centered so the
 visible cells always fill the panel. U/O shrinks/grows the window (R resets),
 and every panel scrolls with you through big mazes.
+
+Projection math (3D mode): each in-window offset `(dx,dy,dz)` from the player
+is yaw-rotated around the vertical, pitch-tilted, and orthographically scaled —
+`x1 = dx·cos α + dz·sin α`, `z1 = dz·cos α − dx·sin α`,
+`y2 = dy·cos β − z1·sin β`, `z2 = z1·cos β + dy·sin β`, screen = center +
+`(x1, y2)·pp` — entirely in 2.14 fixed point from the boot-built sine table
+(no FPU at runtime). `pp = qside·45/(64·V)` pixels per voxel guarantees the
+rotated window cube (diagonal √2) fits the view square at any angle, and `z2`
+picks one of 4 depth bands (brightness + dot size).
+
+### Screens, HUD and progress bars
+
+* **Menus** — three text screens: size (`ENTER N (2-MAX)`, digits/backspace/
+  ESC), type (`1` = perfect, `2` = sparse, Enter defaults to perfect), and for
+  sparse the wall count (shows the exact removable maximum X for your N; up to
+  13 digits; clamped to X). The size menu also reports detected RAM, video
+  mode and MAX N.
+* **HUD** (top band, every frame): `MOVES` (your score), `N`, active view
+  number, your 4D position and the exit's coordinates.
+* **Legend** (bottom band, smaller font): dot color meanings and the full key
+  reference, always on screen.
+* **Progress bars** — three long operations paint a centered bar: maze
+  generation (rooms carved / m⁴), sparse wall removal (volume scanned), and
+  the first H/B press per maze ("MAPPING ROUTES TO THE EXIT...", voxels
+  visited / open-voxel count). All later H/B presses are instant (cache).
+* **Win screen** — your final move count and N; any key returns to the menu.
 
 ### Controls
 
@@ -257,17 +318,50 @@ available — 8 TB boxes welcome (16 TiB identity-map cap).
 
 | file | purpose |
 |------|---------|
-| `maze4d.S` | the whole OS + game, GAS AT&T syntax, ~3300 lines |
+| `maze4d.S` | the whole OS + game, GAS AT&T syntax, ~3560 lines, heavily commented (the file opens with a boot-chain/memory-map/algorithms overview, a code map and the register conventions) |
 | `build.sh` | build → `maze4d.img` (Linux + FreeBSD) |
 | `run.sh` | convenience qemu launcher |
 | `poc/maze4d_poc.c` | tiny portable C proof-of-concept of the same maze algorithms (generation + even-N exit staircase + sparse removal + BFS solvability/shortest-path checks + text walker); build: `cc -O2 -o maze4d_poc poc/maze4d_poc.c`, run: `./maze4d_poc N [seed] [rmwalls]` (N ≥ 2) |
+
+## Source tour (`maze4d.S`)
+
+In file order — every routine carries a detailed block comment in the source:
+
+| section | what it does |
+|---------|--------------|
+| header comment | boot chain, memory map, maze representation, algorithms, display, code map, conventions |
+| `_start`…`dap` | 512-byte boot sector: LBA read with CHS+retry fallback, partition table, `0xAA55` |
+| `stage2` | A20, E820 scan, font copy, VBE mode scoring/set (with next-best retry), into protected mode |
+| `pm32`, `gdt` | bootstrap 4 GiB identity map, PAE→LME→PG, into long mode |
+| `lm64` | x87 sine table, `topaddr` from E820, final 1 GiB/2 MiB-page identity map, maze region pick, MAX N, text scales, RGB565 table / VGA DAC, full screen-layout computation |
+| `menu`, `menu_type`, `menu_walls` | the three menu screens (digit input, clamping, removable-wall formula) |
+| `setup_n` | strides, `sdtab`, start/exit, per-view windows and rotations — everything derived from N |
+| `gen_maze` | wall fill, DFS backtracker (marks-as-stack), progress bar, even-N staircase, `freevox`, sparse removal pass with its own bar |
+| `game_redraw`/`game_key` | the main loop: scancode dispatch to moves/views/assists |
+| `try_move`, `rnd_move` | bounds+wall checked movement (win detection), uniform random step |
+| `srch_init`, `find_opt`, `mark_dir`, `sweep_marks`, `find_best` | the H/B machinery: overlay bar, exit-rooted DFS, cached-mark readout, mark sweeping, two-buffer BFS with DFS fallback |
+| `win_scr` | score screen |
+| `draw_all`, `draw_view`, `mark_draw`, `draw_view2`, `mark2`, `draw_border` | HUD/legend + the four 3D dot-cloud views and six 2D slice panels |
+| `xform`, `dot_draw` | fixed-point rotate/project + depth banding, clipped square dot |
+| `fill_rect`…`sinv` | primitives: clipped rect for all 4 pixel formats, scaled font, decimal/vector text, PS/2 polling, RNG (seed + xorshift32), voxel addressing, sine lookup |
+| data | axis tables, strings, palette (+ color-id map), every global annotated |
 
 ## Implementation notes
 
 * One source file, three CPU modes (16 → 32 → 64) — the 16/32-bit parts avoid
   relocations entirely via a `cpp` address macro, so any ELF linker works.
+* No calling convention: helpers take arguments in documented registers and
+  share state through RIP-relative globals — smallest and fastest for a
+  single-threaded ring-0 program (`fill_rect` guarantees `rbx/rbp/r12–r15`
+  survive, so render loops call it freely).
+* The screen layout is computed once from the mode geometry: HUD and legend
+  band heights from the text scales, then
+  `qside = min((width−3·gap)/2, availh/2)` for the 2×2 3D grid and
+  `s2side = min((width−4·gap)/3, availh/2)` for the 3×2 2D grid, both
+  centered — the views always take the maximum area the resolution allows.
 * The framebuffer is written directly (32/24/16/8 bpp paths); at 8 bpp the DAC
-  palette is programmed manually via ports `3C8h/3C9h`.
+  palette is programmed manually via ports `3C8h/3C9h`; 16 bpp uses a
+  precomputed RGB565 table. All 18 colors live in one indexed palette.
 * Interrupts stay off forever; there is no IDT — any exception would
   triple-fault and reboot, which doubles as a very honest crash handler.
 * The player moves voxel-by-voxel: rooms sit at even coordinates with no outer
