@@ -2,14 +2,19 @@
  *
  * Same maze representation and generator as the assembly OS:
  *   - N*N*N*N voxels, 1 byte each; bit0 = wall, bit0 clear = open
- *   - cells at all-odd coordinates, DFS backtracker carves walls,
+ *   - rooms at all-EVEN coordinates (m = ceil(N/2) per axis), NO outer
+ *     wall shell; DFS backtracker carves the wall voxel between rooms,
  *     visited marker 0x40 | (came_from_dir << 1), start sentinel bit4
+ *   - START (0,0,0,0), EXIT (N-1,...); for even N a 4-step staircase
+ *     corridor connects the last room to the exit corner
+ *   - sparse mode: any still-full voxel is removable (rmwalls = all of
+ *     them empties the grid completely)
  *   - xorshift32 RNG
- * Adds a BFS check (every cell reachable => perfect maze) and an
+ * Adds a BFS check (every room reachable => perfect maze) and an
  * interactive text walker on the 4 hyperplane slices.
  *
  * build: cc -O2 -o maze4d_poc maze4d_poc.c
- * usage: ./maze4d_poc N [seed]        (N >= 5)
+ * usage: ./maze4d_poc N [seed] [rmwalls]   (N >= 2; rmwalls = sparse maze)
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -32,10 +37,11 @@ static long long vaddr(const int c[4]) {
 }
 
 static const int sgn1[2] = {1, -1};
+static long long count_removable(void);
 
 static void gen(void) {
     long long sd[8];
-    int cur[4] = {1, 1, 1, 1}, d;
+    int cur[4] = {0, 0, 0, 0}, d;
     for (d = 0; d < 8; d++) sd[d] = S[d >> 1] * sgn1[d & 1];
     memset(mz, 0x01, total);
     long long p = vaddr(cur);
@@ -44,7 +50,7 @@ static void gen(void) {
         int cand[8], nc = 0;
         for (d = 0; d < 8; d++) {          /* unvisited neighbors */
             int ax = d >> 1, v = cur[ax] + 2 * sgn1[d & 1];
-            if (v < 1 || v > maxc) continue;
+            if (v < 0 || v > maxc) continue;
             if (mz[p + 2 * sd[d]] == 0x01) cand[nc++] = d;
         }
         if (nc) {                          /* carve forward */
@@ -62,17 +68,70 @@ static void gen(void) {
             p += 2 * sd[d];
         }
     }
+    if (maxc != N - 1) {                   /* even N: exit staircase */
+        int c[4] = {maxc, maxc, maxc, maxc};
+        for (d = 0; d < 4; d++) { c[d]++; mz[vaddr(c)] = 0x00; }
+    }
+}
+
+/* sparse mode: remove exactly `need` of the still-full voxels anywhere in
+ * the grid, by sequential random sampling over one linear scan (mirrors
+ * the asm pass).  Returns the number of walls actually removed. */
+static long long sparse(long long need) {
+    long long removed = 0, rem = count_removable();
+    if (need > rem) need = rem;
+    for (long long i = 0; i < total && need; i++) {
+        if (mz[i] != 0x01) continue;
+        uint64_t r = ((uint64_t)rng_next() << 32) | rng_next();
+        if (r % rem < (uint64_t)need) { mz[i] = 0; need--; removed++; }
+        rem--;
+    }
+    return removed;
+}
+
+/* count every full voxel (all are removable in the new model) */
+static long long count_removable(void) {
+    long long cnt = 0;
+    for (long long i = 0; i < total; i++) cnt += mz[i] & 1;
+    return cnt;
+}
+
+/* BFS shortest distance start -> exit in single-voxel steps, -1 if cut off */
+static long long bfs_dist(void) {
+    long long *q = malloc(total * sizeof *q), head = 0, tail = 0;
+    long long *dist = malloc(total * sizeof *dist);
+    if (!q || !dist) { fprintf(stderr, "poc oom\n"); exit(1); }
+    for (long long i = 0; i < total; i++) dist[i] = -1;
+    int st[4] = {0, 0, 0, 0}, e[4] = {(int)N - 1, (int)N - 1, (int)N - 1, (int)N - 1};
+    long long ep = vaddr(e);
+    q[tail++] = vaddr(st); dist[q[0]] = 0;
+    while (head < tail) {
+        long long p = q[head++];
+        long long rem = p;
+        int co[4];
+        for (int i = 3; i >= 0; i--) { co[i] = (int)(rem / S[i]); rem %= S[i]; }
+        for (int d = 0; d < 8; d++) {
+            int ax = d >> 1, v = co[ax] + sgn1[d & 1];
+            if (v < 0 || v >= N) continue;
+            long long np = p + S[ax] * sgn1[d & 1];
+            if (mz[np] & 1) continue;
+            if (dist[np] < 0) { dist[np] = dist[p] + 1; q[tail++] = np; }
+        }
+    }
+    long long r = dist[ep];
+    free(q); free(dist);
+    return r;
 }
 
 static int bfs_all_reachable(void) {
     long long cells = 0, seen = 0, head = 0, tail = 0, qcap, i;
-    long long c1 = (maxc + 1) / 2;         /* cells per axis */
+    long long c1 = maxc / 2 + 1;           /* rooms per axis */
     qcap = c1 * c1 * c1 * c1;
     long long *q = malloc(qcap * sizeof *q);
     uint8_t *vis = calloc(total, 1);
     if (!q || !vis) { fprintf(stderr, "poc oom\n"); exit(1); }
     cells = qcap;
-    int st[4] = {1, 1, 1, 1};
+    int st[4] = {0, 0, 0, 0};
     q[tail++] = vaddr(st); vis[q[0]] = 1; seen = 1;
     while (head < tail) {
         long long p = q[head++];
@@ -82,14 +141,14 @@ static int bfs_all_reachable(void) {
             long long rem = p, co;
             for (i = 3; i > (d >> 1); i--) rem %= S[i];
             co = rem / S[d >> 1];
-            if (co + 2 * sgn1[d & 1] < 1 || co + 2 * sgn1[d & 1] > maxc) continue;
+            if (co + 2 * sgn1[d & 1] < 0 || co + 2 * sgn1[d & 1] > maxc) continue;
             if (mz[p + sd] & 1) continue;  /* wall not carved */
             long long np = p + 2 * sd;
             if (!vis[np]) { vis[np] = 1; q[tail++] = np; seen++; }
         }
     }
     free(q); free(vis);
-    printf("BFS: reached %lld of %lld cells -> %s\n", seen, cells,
+    printf("BFS: reached %lld of %lld rooms -> %s\n", seen, cells,
            seen == cells ? "PERFECT MAZE" : "BROKEN!");
     return seen == cells;
 }
@@ -110,14 +169,15 @@ static void slice(const int p[4], int a0, int a1, const char *t) {
 }
 
 int main(int argc, char **argv) {
-    int p[4] = {1, 1, 1, 1}, e[4], moves = 0, i;
-    if (argc < 2 || (N = atoll(argv[1])) < 5) {
-        fprintf(stderr, "usage: %s N [seed]  (N >= 5)\n", argv[0]);
+    int p[4] = {0, 0, 0, 0}, e[4], moves = 0, i;
+    if (argc < 2 || (N = atoll(argv[1])) < 2) {
+        fprintf(stderr, "usage: %s N [seed]  (N >= 2)\n", argv[0]);
         return 1;
     }
     if (argc > 2) rngs = (uint32_t)strtoul(argv[2], 0, 0);
     if (!rngs) rngs = 0x12345;
-    maxc = 2 * (int)((N - 1) / 2) - 1;
+    long long rmw = argc > 3 ? atoll(argv[3]) : 0;
+    maxc = 2 * (int)((N + 1) / 2) - 2;
     S[0] = 1; S[1] = N; S[2] = N * N; S[3] = N * N * N;
     total = N * N * N * N;
     mz = malloc(total);
@@ -125,8 +185,32 @@ int main(int argc, char **argv) {
     printf("generating %lldx%lldx%lldx%lld maze...\n", N, N, N, N);
     gen();
     if (!bfs_all_reachable()) return 1;
-    for (i = 0; i < 4; i++) e[i] = maxc;
-    printf("start (1,1,1,1) -> exit (%d,%d,%d,%d)\n", e[0], e[1], e[2], e[3]);
+    {
+        long long m = (N + 1) / 2;
+        long long m4 = m * m * m * m;
+        long long fml = total - (2 * m4 - 1) - (N % 2 == 0 ? 4 : 0);
+        long long cnt = count_removable();
+        printf("removable walls: counted=%lld formula=%lld -> %s\n",
+               cnt, fml, cnt == fml ? "OK" : "MISMATCH!");
+        if (cnt != fml) return 1;
+        long long d0 = bfs_dist();
+        printf("shortest path (perfect): %lld voxel steps\n", d0);
+        if (rmw > 0) {
+            long long got = sparse(rmw);
+            long long want = rmw > fml ? fml : rmw;
+            long long left = count_removable();
+            long long d1 = bfs_dist();
+            printf("sparse: removed=%lld want=%lld left=%lld -> %s\n",
+                   got, want, left, got == want && left == fml - want
+                   ? "OK" : "MISMATCH!");
+            printf("shortest path (sparse): %lld voxel steps -> %s\n",
+                   d1, d1 > 0 && d1 <= d0 ? "OK" : "BROKEN!");
+            if (got != want || left != fml - want || d1 < 0 || d1 > d0)
+                return 1;
+        }
+    }
+    for (i = 0; i < 4; i++) e[i] = (int)N - 1;
+    printf("start (0,0,0,0) -> exit (%d,%d,%d,%d)\n", e[0], e[1], e[2], e[3]);
     printf("keys: d/a=+-x  s/w=+-y  e/q=+-z  k/j=+-w  p=print slices  x=quit\n");
     for (;;) {
         if (!memcmp(p, e, sizeof p)) {

@@ -1,21 +1,102 @@
-/* maze4d.S - 4D maze game as a tiny AMD64 long-mode OS.
+/* maze4d.S - 4D maze game as a tiny AMD64 long-mode OS (GAS, AT&T syntax).
  *
- * Boot chain: BIOS -> boot sector (loads rest) -> 16-bit stage2
- * (A20, E820, 8x8 font copy, VBE mode set) -> 32-bit trampoline
- * (bootstrap 4 GiB identity map, 2 MiB pages) -> 64-bit long mode
- * ("modern unreal mode": the whole physical address space up to
- * 16 TiB identity-mapped RWX with 1 GiB or 2 MiB pages, WP=0,
- * no NX, ring 0, no IDT - flat memory, zero protection).
+ * ----------------------------------------------------------------------
+ * BOOT CHAIN
+ * ----------------------------------------------------------------------
+ *   BIOS -> boot sector at 0x7C00 (loads NSECT more sectors via INT 13h
+ *   LBA, CHS fallback) -> 16-bit stage2 (enable A20, E820 memory map,
+ *   copy 8x8 BIOS font, pick + set best VESA mode) -> 32-bit protected
+ *   mode trampoline (builds a bootstrap 4 GiB identity map with 2 MiB
+ *   pages) -> 64-bit long mode -> final page tables identity-map ALL
+ *   detected physical RAM (up to 16 TiB, 1 GiB pages when the CPU has
+ *   pdpe1gb, else 2 MiB pages).
  *
- * Game: N x N x N x N voxel maze (wall/free), perfect maze carved
- * by an iterative DFS backtracker. Move +/-X +/-Y +/-Z +/-W
- * (W = ata/kata). Reach the exit at (maxc,maxc,maxc,maxc) from
- * (1,1,1,1). Score = number of moves.
+ *   The result is "modern unreal mode": flat 64-bit ring 0, the whole
+ *   address space identity-mapped RWX, WP=0, no NX, no IDT, interrupts
+ *   off, keyboard polled straight from port 0x60 - all memory, zero
+ *   protection, exactly like the old real-mode "unreal" trick but for
+ *   the full 64-bit world.
  *
- * Display: best VESA LFB mode up to 1920x1200 (32/24/16/8 bpp,
- * VGA 13h fallback). Four independently rotatable/zoomable 3D
- * views: XYZ, XYW, XZW, YZW - each a 3D slice through the player
- * along the missing axis. Open cells drawn as depth-shaded dots.
+ * ----------------------------------------------------------------------
+ * PHYSICAL MEMORY MAP
+ * ----------------------------------------------------------------------
+ *   0x05000  E820 map (count word, entries at +0x10)
+ *   0x05800  VBE controller info      0x05900  VBE mode info
+ *   0x07C00  this image (boot sector + <= NSECT sectors, <= 32256 B)
+ *   0x10000  bootstrap page tables (4 GiB, 2 MiB pages)
+ *   0x70000  8x8 BIOS font copy       0x90000  64-bit stack (grows down)
+ *   0x100000 final page tables        largest E820 region: the maze
+ *
+ *   Maze region layout: N^4 voxel bytes at mazeb, then (16-aligned)
+ *   the rest of the region is scratch for find_best's two BFS wave
+ *   buffers (wvA/wvB, wvcap bytes each).
+ *
+ * ----------------------------------------------------------------------
+ * MAZE REPRESENTATION
+ * ----------------------------------------------------------------------
+ *   N^4 voxels, one byte each, index = x + N*y + N^2*z + N^3*w.
+ *   bit0 = 1 wall, bit0 = 0 open.  Upper bits are TEMPORARY search /
+ *   generator marks: 0x40|(came_from_dir<<1) visited, bit4 = root
+ *   sentinel; sweep_marks() clears everything but bit0 afterwards.
+ *
+ *   "Rooms" live at all-EVEN coordinates 0..maxc (m = ceil(N/2) rooms
+ *   per axis, maxc = 2m-2); the voxels between adjacent rooms are the
+ *   carvable walls.  There is NO outer wall shell: the grid edge itself
+ *   is the boundary.  START = (0,0,0,0), EXIT = (N-1,N-1,N-1,N-1).
+ *   For odd N the exit corner is a room (maxc = N-1); for even N it
+ *   lies one layer beyond the rooms, so gen_maze carves a 4-step
+ *   staircase corridor (maxc,..) -> (N-1,..) after the DFS.  Minimum
+ *   N = 2: a single room plus that corridor = a 4-move micro maze.
+ *   Directions are numbered 0..7 = +x,-x,+y,-y,+z,-z,+w,-w: axis =
+ *   dir>>1, sign = dir&1 (dsgn1), opposite = dir^1, single-voxel byte
+ *   offset = sdtab[dir] = +-stride[axis].
+ *
+ * ----------------------------------------------------------------------
+ * ALGORITHMS
+ * ----------------------------------------------------------------------
+ *   gen_maze   iterative DFS backtracker carving a PERFECT maze (every
+ *              pair of cells joined by exactly one path).  The stack is
+ *              the maze itself: each visited cell stores its came-from
+ *              direction in the voxel byte, so backtracking follows the
+ *              marks and needs no extra memory.
+ *   sparse     optional second pass: remove exactly R of the
+ *              X = N^4 - (2m^4-1) - (4 if N even) still-full voxels
+ *              (ALL walls are candidates), chosen uniformly by
+ *              sequential random sampling over one linear scan
+ *              (candidate removed with probability need/remaining),
+ *              turning the maze into a braided/looped one, up to a
+ *              completely open N^4 box at R = X.
+ *   find_opt   H key "hint": deterministic DFS from the exit that keeps
+ *              its visited marks for the whole search, i.e. it walks a
+ *              FIXED spanning tree rooted at the exit.  Every press
+ *              moves the player one step up that tree, so the distance
+ *              to the exit strictly decreases - guaranteed convergence
+ *              even on looped sparse mazes (where the route may be
+ *              sub-optimal).  On a perfect maze the tree path IS the
+ *              unique (optimal) route.
+ *   find_best  B key "best": true shortest next step - breadth-first
+ *              search from the exit using wave buffers in the maze
+ *              region's slack memory; falls back to find_opt if the
+ *              slack cannot hold a wave.  Marks are wiped afterwards.
+ *   rng        xorshift32, seeded from the TSC at boot.
+ *
+ * ----------------------------------------------------------------------
+ * DISPLAY & CONTROLS
+ * ----------------------------------------------------------------------
+ *   Picks the highest-resolution VESA LFB mode the card reports
+ *   (32/24/16/8 bpp, tried best-first with next-best retry; VGA 13h
+ *   fallback).  Two view modes, TAB toggles:
+ *     3D: four rotatable/zoomable axonometric views XYZ, XYW, XZW, YZW,
+ *         each a 3D slice through the player along the missing axis.
+ *     2D: all six axis-pair projections XY, XZ, XW, YZ, YW, ZW in a
+ *         3x2 grid, sliced at the player's other two coordinates.
+ *   Keys: arrows = +-X/+-Y, W/S = +-Z, A/K = +-W (ata/kata),
+ *   1-4 select 3D view, J/L/I/M rotate, U/O zoom, R reset, X random
+ *   move, H hint move, B best move, ESC menu, any key after winning.
+ *
+ *   Menu flow: N >= 2 (maze is N^4 voxels) -> maze type (1 perfect /
+ *   2 sparse) -> for sparse: how many walls to remove (0..X).
+ *   Score = number of moves, lower is better.
  *
  * Build: cc -c (cpp needed for A()), link flat binary at 0x7C00.
  */
@@ -566,7 +647,7 @@ rg_d:
     cmpq $1300,%r14
     jae 1f
     jmp panic_noram
-1:  movl $5,%ebx               /* maxN: largest n<=2000, n^4<=size */
+1:  movl $2,%ebx               /* maxN: largest n<=2000, n^4<=size */
 2:  leal 1(%rbx),%eax
     cmpl $2000,%eax
     ja 3f
@@ -763,7 +844,10 @@ panic_noram:
 1:  hlt
     jmp 1b
 
-/* ---------------- menu ---------------- */
+/* ---------------- menu ----------------
+ * Screen flow: menu (enter N) -> menu_type (1 perfect / 2 sparse) ->
+ * [menu_walls (how many walls to remove)] -> setup_n -> game.
+ * Digit input into inbuf/inlen, backspace edits, ESC returns here. */
 menu:
     movl $0,inlen(%rip)
     movq $0,errstr(%rip)
@@ -897,21 +981,179 @@ mg_l:
 mg_d:
     testl %eax,%eax
     jz menu_epos
-    cmpl $5,%eax
+    cmpl $2,%eax
     jae 1f
-    movl $5,%eax               /* clamp tiny N up to 5 */
+    movl $2,%eax               /* clamp tiny N up to 2 (see header) */
 1:  cmpl maxN(%rip),%eax
     jbe 2f
     movl maxN(%rip),%eax
 2:  movl %eax,N(%rip)
-    jmp setup_n
+    jmp menu_type
 menu_epos:
     leaq s_epos(%rip),%rax
     movq %rax,errstr(%rip)
     movl $0,inlen(%rip)
     jmp menu_draw
 
-/* ---------------- per-N setup ---------------- */
+/* ---------------- maze type menu ---------------- */
+menu_type:
+    call clear_fb
+    movl $16,curx(%rip)
+    movl $12,cury(%rip)
+    movl $ID_ACC,colr(%rip)
+    leaq s_ty0(%rip),%rsi
+    call draw_str
+    movl N(%rip),%eax
+    call draw_dec
+    call menu_nl
+    call menu_nl
+    movl $ID_TXT,colr(%rip)
+    leaq s_ty1(%rip),%rsi
+    call draw_str
+    call menu_nl
+    leaq s_ty2(%rip),%rsi
+    call draw_str
+    call menu_nl
+    call menu_nl
+    movl $ID_DIM,colr(%rip)
+    leaq s_ty3(%rip),%rsi
+    call draw_str
+mt_key:
+    call getkey
+    cmpb $0x01,%al             /* ESC: back to size menu */
+    je menu
+    cmpb $0x1C,%al             /* Enter = perfect */
+    je mt_perf
+    cmpb $0x02,%al             /* 1 = perfect */
+    je mt_perf
+    cmpb $0x03,%al             /* 2 = sparse */
+    je menu_walls
+    jmp mt_key
+mt_perf:
+    movq $0,rmwalls(%rip)
+    jmp setup_n
+
+/* ---------------- sparse: how many walls to remove ----------------
+ * After perfect-maze carving of m^4 cells (m cells per axis) there are
+ * 4*m^3*(m-1) walls between adjacent cell pairs, of which m^4-1 were
+ * carved, leaving  maxrm = m^3*(3m-4)+1  removable walls. */
+menu_walls:
+    /* X = removable walls = ALL full voxels of the perfect maze:
+     * N^4 - (2m^4 - 1) - (4 if N even), m = ceil(N/2) rooms per axis
+     * (frees = m^4 rooms + m^4-1 carved passages + 4 exit-corridor
+     * voxels when N is even).  R = X empties the grid completely. */
+    movl N(%rip),%eax
+    movq %rax,%rcx
+    imulq %rax,%rcx
+    imulq %rcx,%rcx            /* N^4 */
+    incl %eax
+    shrl $1,%eax               /* m */
+    movq %rax,%rdx
+    imulq %rax,%rdx
+    imulq %rdx,%rdx            /* m^4 */
+    addq %rdx,%rdx
+    decq %rdx                  /* free voxels (odd N) */
+    subq %rdx,%rcx
+    testl $1,N(%rip)
+    jnz 1f
+    subq $4,%rcx               /* even N: exit corridor frees 4 more */
+1:  movq %rcx,maxrm(%rip)
+    movl $0,inlen(%rip)
+mw_draw:
+    call clear_fb
+    movl $16,curx(%rip)
+    movl $12,cury(%rip)
+    movl $ID_ACC,colr(%rip)
+    leaq s_wl0(%rip),%rsi
+    call draw_str
+    movl N(%rip),%eax
+    call draw_dec
+    call menu_nl
+    call menu_nl
+    movl $ID_TXT,colr(%rip)
+    leaq s_wl1(%rip),%rsi
+    call draw_str
+    movq maxrm(%rip),%rax
+    call draw_dec
+    call menu_nl
+    leaq s_wl2(%rip),%rsi
+    call draw_str
+    call menu_nl
+    movl $ID_ACC,colr(%rip)
+    leaq s_cur(%rip),%rsi
+    call draw_str
+    xorl %ebx,%ebx
+mw_il:
+    cmpl inlen(%rip),%ebx
+    jae mw_id
+    leaq inbuf(%rip),%rax
+    movb (%rax,%rbx),%al
+    call draw_char
+    incl %ebx
+    jmp mw_il
+mw_id:
+    movb $'_',%al
+    call draw_char
+    call menu_nl
+    call menu_nl
+    movl $ID_DIM,colr(%rip)
+    leaq s_wl3(%rip),%rsi
+    call draw_str
+mw_key:
+    call getkey
+    cmpb $0x01,%al             /* ESC: back */
+    je menu
+    cmpb $0x1C,%al             /* enter */
+    je mw_go
+    cmpb $0x0E,%al             /* backspace */
+    je mw_bs
+    cmpb $0x02,%al
+    jb mw_key
+    cmpb $0x0B,%al
+    ja mw_key
+    movzbl %al,%eax
+    leaq scan2dig-2(%rip),%rdx
+    movb (%rdx,%rax),%dl
+    movl inlen(%rip),%ecx
+    cmpl $13,%ecx              /* 13 digits < 2^63, plenty */
+    jae mw_key
+    leaq inbuf(%rip),%rax
+    movb %dl,(%rax,%rcx)
+    incl %ecx
+    movl %ecx,inlen(%rip)
+    jmp mw_draw
+mw_bs:
+    movl inlen(%rip),%ecx
+    testl %ecx,%ecx
+    jz mw_key
+    decl %ecx
+    movl %ecx,inlen(%rip)
+    jmp mw_draw
+mw_go:
+    xorl %eax,%eax             /* parse 64-bit, empty = 0 */
+    xorl %ebx,%ebx
+    movl inlen(%rip),%ecx
+1:  cmpl %ecx,%ebx
+    jae 2f
+    imulq $10,%rax,%rax
+    leaq inbuf(%rip),%rdx
+    movzbl (%rdx,%rbx),%edx
+    subl $'0',%edx
+    addq %rdx,%rax
+    incl %ebx
+    jmp 1b
+2:  cmpq maxrm(%rip),%rax      /* clamp to removable count */
+    jbe 3f
+    movq maxrm(%rip),%rax
+3:  movq %rax,rmwalls(%rip)
+    jmp setup_n
+
+/* ---------------- per-N setup ----------------
+ * Computes everything derived from N: strides (1,N,N^2,N^3), total voxel
+ * count, maxc (largest even room coordinate), cells = m^4, the sdtab
+ * single-voxel offsets for the 8 directions, start/exit positions,
+ * default view windows/rotations for the 3D and 2D modes, then generates
+ * the maze and enters the game loop. */
 setup_n:
     movl N(%rip),%eax
     movq %rax,Nq(%rip)
@@ -925,11 +1167,11 @@ setup_n:
     imulq %rax,%rdx
     movq %rdx,total(%rip)
     movl N(%rip),%eax
-    decl %eax
-    shrl $1,%eax               /* Mc */
+    incl %eax
+    shrl $1,%eax               /* Mc = rooms per axis = ceil(N/2) */
     movl %eax,%edx
-    leal -1(%rax,%rax),%eax
-    movl %eax,maxc(%rip)
+    leal -2(%rax,%rax),%eax
+    movl %eax,maxc(%rip)       /* last room coord = 2*(Mc-1) */
     movl %edx,%eax
     movq %rax,%rcx
     imulq %rcx,%rcx
@@ -948,11 +1190,12 @@ sdl:
     incl %ecx
     cmpl $4,%ecx
     jb sdl
-    movl $1,pcoord(%rip)
-    movl $1,pcoord+4(%rip)
-    movl $1,pcoord+8(%rip)
-    movl $1,pcoord+12(%rip)
-    movl maxc(%rip),%eax
+    movl $0,pcoord(%rip)       /* start at the origin corner */
+    movl $0,pcoord+4(%rip)
+    movl $0,pcoord+8(%rip)
+    movl $0,pcoord+12(%rip)
+    movl N(%rip),%eax          /* exit at the far corner (N-1,...) */
+    decl %eax
     movl %eax,ecoord(%rip)
     movl %eax,ecoord+4(%rip)
     movl %eax,ecoord+8(%rip)
@@ -1001,9 +1244,18 @@ sdl:
     call gen_maze
     jmp game_redraw
 
-/* ---------------- maze generator (iterative DFS) ---------------- */
+/* ---------------- maze generator (iterative DFS) ----------------
+ * Fill the volume with walls, then carve a PERFECT maze over the rooms at
+ * all-even coordinates with a depth-first backtracker.  The DFS stack is
+ * the maze itself: entering a room stores 0x40|(came_from<<1) in its voxel
+ * byte (start room = 0x50 sentinel), backtracking reads the mark, clears
+ * it, and returns; carving opens the wall voxel between the two rooms.
+ * A progress bar tracks gdone/cells.  Afterwards: for even N a staircase
+ * corridor connects the last room to the exit corner, and an optional
+ * sparse pass (rmwalls > 0) removes random walls - see gdon below. */
 gen_maze:
     pushq %rbx
+    pushq %rbp
     pushq %r12
     pushq %r13
     pushq %r14
@@ -1049,10 +1301,10 @@ gen_maze:
     movq %rdx,%rcx
     andl $7,%ecx
     rep stosb
-    movl $1,gcur(%rip)
-    movl $1,gcur+4(%rip)
-    movl $1,gcur+8(%rip)
-    movl $1,gcur+12(%rip)
+    movl $0,gcur(%rip)
+    movl $0,gcur+4(%rip)
+    movl $0,gcur+8(%rip)
+    movl $0,gcur+12(%rip)
     leaq gcur(%rip),%rsi
     call vox_addr_v
     movq %rax,%rbx
@@ -1070,8 +1322,8 @@ gcand:
     andl $1,%eax
     leaq dsgn2(%rip),%rcx
     addl (%rcx,%rax,4),%edx
-    cmpl $1,%edx
-    jl gskip
+    testl %edx,%edx
+    js gskip
     cmpl maxc(%rip),%edx
     jg gskip
     leaq sdtab(%rip),%rax
@@ -1144,14 +1396,91 @@ gback:
     leaq (%rbx,%rdx,2),%rbx
     jmp genl
 gdon:
+    /* Even N: the exit corner (N-1,...) lies one voxel beyond the last
+     * room layer (maxc = N-2).  Carve a staircase corridor from room
+     * (maxc,maxc,maxc,maxc) to the exit, bumping one axis at a time to
+     * N-1 and opening the voxel after each step.  Still a perfect maze:
+     * a tree plus one attached dead-end path.  (Odd N: maxc = N-1, the
+     * exit corner already is a room - nothing to do.) */
+    movl maxc(%rip),%eax
+    incl %eax
+    cmpl N(%rip),%eax
+    je gnost
+    movl maxc(%rip),%eax
+    movl %eax,gcur(%rip)
+    movl %eax,gcur+4(%rip)
+    movl %eax,gcur+8(%rip)
+    movl %eax,gcur+12(%rip)
+    xorl %r13d,%r13d
+gst_l:
+    leaq gcur(%rip),%rax
+    incl (%rax,%r13,4)         /* coord[axis] = N-1 */
+    leaq gcur(%rip),%rsi
+    call vox_addr_v
+    movb $0,(%rax)
+    incl %r13d
+    cmpl $4,%r13d
+    jb gst_l
+gnost:
+    movq rmwalls(%rip),%r14    /* sparse: remove R random walls */
+    testq %r14,%r14
+    jz grt
+    movl $16,curx(%rip)        /* status line under the bar */
+    movl bary(%rip),%eax
+    addl $20,%eax
+    movl %eax,cury(%rip)
+    movl $ID_TXT,colr(%rip)
+    leaq s_rmw(%rip),%rsi
+    call draw_str
+/* Sequential random sampling over a single linear scan of all N^4 voxel
+ * bytes: every still-full voxel (byte==1) is a candidate; rem starts at
+ * maxrm (the exact number of full voxels, see menu_walls) and an unbroken
+ * wall is removed with probability need/rem, which picks every possible
+ * subset of `need` walls with equal probability. */
+    movq maxrm(%rip),%r15      /* rem = full voxels left to consider */
+    testq %r15,%r15
+    jz grt
+    cmpq %r15,%r14             /* safety clamp: need <= rem */
+    jbe 1f
+    movq %r15,%r14
+1:  movq mazeb(%rip),%rbx
+    movq total(%rip),%rbp
+rml:
+    cmpb $1,(%rbx)             /* still a wall? */
+    jne rmn
+    call rng_next              /* 64-bit random % rem */
+    movl %eax,%r9d
+    call rng_next
+    shlq $32,%r9
+    movl %eax,%eax
+    orq %r9,%rax
+    xorl %edx,%edx
+    divq %r15
+    cmpq %r14,%rdx             /* rdx < need: remove this wall */
+    jae rmk
+    movb $0,(%rbx)
+    decq %r14
+    jz grt                     /* removed all requested */
+rmk:
+    decq %r15                  /* one fewer candidate left */
+rmn:
+    incq %rbx
+    decq %rbp
+    jnz rml
+grt:
     popq %r15
     popq %r14
     popq %r13
     popq %r12
+    popq %rbp
     popq %rbx
     ret
 
-/* ---------------- game loop ---------------- */
+/* ---------------- game loop ----------------
+ * getkey scancodes -> actions:
+ *   ESC menu | arrows +-X/+-Y | W/S +-Z | A/K +-W | TAB 3D/2D mode
+ *   1-4 active 3D view | J/L yaw | I/M pitch | U/O zoom | R reset views
+ *   X random move | H hint move (find_opt) | B best move (find_best) */
 game_redraw:
     call draw_all
 game_key:
@@ -1273,9 +1602,14 @@ game_key:
     jmp game_redraw
 8:  cmpb $0x2D,%al             /* X: random move */
     je rnd_move
-    cmpb $0x23,%al             /* H: optimal next step */
-    jne game_key
+    cmpb $0x23,%al             /* H: assisted move (DFS path) */
+    jne 9f
     call find_opt
+    jmp doassist
+9:  cmpb $0x30,%al             /* B: best move (true shortest, BFS) */
+    jne game_key
+    call find_best
+doassist:
     testl %eax,%eax
     js game_redraw
     movl %eax,%edi
@@ -1283,7 +1617,10 @@ domv:
     call try_move
     jmp game_redraw
 
-try_move:                      /* edi = dir 0..7 */
+/* try_move: edi = dir 0..7.  Bounds-check the destination (unsigned cmp
+ * catches -1), reject walls, commit the move, count it, and jump to the
+ * win screen (dropping our return address) when the exit is reached. */
+try_move:
     movl %edi,%eax
     shrl $1,%eax               /* axis */
     movl %edi,%ecx
@@ -1356,12 +1693,15 @@ rm_s:
     movzbl (%rcx,%rax),%edi
     jmp domv
 
-/* optimal next step: DFS from exit to player over open voxels.
- * The maze is a perfect maze (a tree), so the DFS discovery path is the
- * unique shortest path.  In-stack voxels hold 0x40|(camefrom<<1) like gen;
- * dead branches are unmarked while backtracking, and the scan resumes past
- * the direction just unwound, so nothing is ever revisited (no extra memory,
- * no cleanup sweep).  Returns eax = dir 0..7 for the player, -1 if none. */
+/* assisted move: DFS from exit to player over open voxels.
+ * Visited voxels keep 0x40|(camefrom<<1) permanently during the search, so
+ * each voxel is entered at most once and the run time is linear even when
+ * the maze has cycles (sparse mazes).  The came-from chain of the first
+ * discovery is a simple path to the exit: on a perfect maze it is THE unique
+ * (shortest) path; on a sparse maze it is a valid, converging (depth in the
+ * fixed DFS spanning tree strictly decreases every press) but possibly
+ * sub-optimal path.  All marks are wiped by sweep_marks before returning.
+ * Returns eax = dir 0..7 for the player, -1 if unreachable (impossible). */
 find_opt:
     pushq %rbx
     pushq %rbp
@@ -1420,8 +1760,7 @@ fo_back:
     movzbl (%rbp),%eax
     testb $0x10,%al            /* back at exit: exhausted */
     jnz fo_fail
-    movb $0,(%rbp)             /* unmark dead branch */
-    shrl $1,%eax
+    shrl $1,%eax               /* mark stays (visited forever) */
     andl $7,%eax
     movl %eax,%r13d            /* d = came-from (cur -> parent) */
     movl %eax,%ecx
@@ -1444,19 +1783,10 @@ fo_found:
     shrl $1,%eax
     andl $7,%eax
     movl %eax,%r14d
-fo_cl:                         /* unmark the path player -> exit */
-    movzbl (%rbp),%eax
-    movb $0,(%rbp)
-    testb $0x10,%al            /* exit sentinel cleared: done */
-    jnz fo_ret
-    shrl $1,%eax
-    andl $7,%eax
-    leaq sdtab(%rip),%rdx
-    movq (%rdx,%rax,8),%rax
-    addq %rax,%rbp
-    jmp fo_cl
+    call sweep_marks           /* restore maze to walls/open only */
+    jmp fo_ret
 fo_fail:
-    movb $0,(%rbp)
+    call sweep_marks
     movl $-1,%r14d
 fo_ret:
     movl %r14d,%eax
@@ -1468,6 +1798,182 @@ fo_ret:
     popq %rbx
     ret
 
+/* clear every non-wall bit in the whole maze volume (removes all search
+ * marks left by find_opt / find_best).  8 bytes at a time. */
+sweep_marks:
+    movq mazeb(%rip),%rdi
+    movq total(%rip),%rcx
+    movq %rcx,%rdx
+    shrq $3,%rcx
+    movabsq $0x0101010101010101,%rax
+    testq %rcx,%rcx
+    jz 2f
+1:  andq %rax,(%rdi)
+    addq $8,%rdi
+    decq %rcx
+    jnz 1b
+2:  andl $7,%edx
+    jz 4f
+3:  andb $1,(%rdi)
+    incq %rdi
+    decl %edx
+    jnz 3b
+4:  ret
+
+/* best move: true shortest next step via breadth-first search from the exit.
+ * The BFS wave queues live in the spare memory of the maze's E820 region
+ * (after the N^4 maze bytes): entry = voxel addr (8) + 4 packed u16 coords
+ * (8).  Parent directions are stored in the voxel bytes exactly like
+ * find_opt, so the player's mark is the next hop of a genuine shortest path.
+ * If the spare memory is too small (or a wave overflows it), falls back to
+ * find_opt.  All marks are swept before returning.
+ * Returns eax = dir 0..7, -1 if unreachable (impossible). */
+find_best:
+    pushq %rbx
+    pushq %rbp
+    pushq %r12
+    pushq %r13
+    pushq %r14
+    pushq %r15
+    movq mazeb(%rip),%rax      /* wave buffers = region slack */
+    addq total(%rip),%rax
+    addq $15,%rax
+    andq $-16,%rax
+    movq %rax,wvA(%rip)
+    movq mazeb(%rip),%rdx
+    addq mazesz(%rip),%rdx     /* region end */
+    subq %rax,%rdx             /* slack bytes */
+    jle fb_nobuf
+    shrq $1,%rdx
+    andq $-16,%rdx             /* bytes per half */
+    cmpq $64,%rdx
+    jb fb_nobuf
+    movq %rdx,wvcap(%rip)
+    addq wvA(%rip),%rdx
+    movq %rdx,wvB(%rip)
+    leaq pcoord(%rip),%rsi
+    call vox_addr_v
+    movq %rax,%r15             /* player voxel addr */
+    leaq ecoord(%rip),%rsi
+    call vox_addr_v
+    cmpq %r15,%rax
+    je fb_fail
+    movb $0x50,(%rax)          /* exit sentinel */
+    movq wvA(%rip),%rdi        /* seed wave = exit */
+    movq %rax,(%rdi)
+    movl N(%rip),%eax
+    decl %eax                  /* exit coords = N-1 on every axis */
+    movw %ax,8(%rdi)
+    movw %ax,10(%rdi)
+    movw %ax,12(%rdi)
+    movw %ax,14(%rdi)
+    movq $1,wcur(%rip)
+    movq $0,wnxt(%rip)
+fb_wave:
+    xorl %r13d,%r13d           /* entry index in current wave */
+fb_ent:
+    cmpq wcur(%rip),%r13
+    jae fb_wdone
+    movq %r13,%rdx
+    shlq $4,%rdx
+    addq wvA(%rip),%rdx
+    movq (%rdx),%rbp           /* voxel addr */
+    movq 8(%rdx),%r12          /* packed coords 4 x u16 */
+    xorl %ebx,%ebx             /* dir */
+fb_dir:
+    cmpl $8,%ebx
+    jae fb_edone
+    movl %ebx,%ecx
+    shrl $1,%ecx               /* axis */
+    shll $4,%ecx               /* field shift */
+    movq %r12,%rdx
+    shrq %cl,%rdx
+    movzwl %dx,%edx            /* coord on that axis */
+    movl %ebx,%eax
+    andl $1,%eax
+    leaq dsgn1(%rip),%rsi
+    addl (%rsi,%rax,4),%edx    /* new coord */
+    cmpl N(%rip),%edx
+    jae fb_nd                  /* out of bounds (unsigned) */
+    leaq sdtab(%rip),%rax
+    movq (%rax,%rbx,8),%rdi
+    addq %rbp,%rdi             /* neighbor addr */
+    cmpb $0,(%rdi)
+    jne fb_nd                  /* wall or already visited */
+    movl %ebx,%eax             /* mark: came-from = dir^1 */
+    xorl $1,%eax
+    leal (%rax,%rax),%eax
+    orl $0x40,%eax
+    movb %al,(%rdi)
+    cmpq %r15,%rdi
+    je fb_found
+    movq wnxt(%rip),%rax       /* push to next wave */
+    leaq 1(%rax),%rsi
+    shlq $4,%rsi
+    cmpq wvcap(%rip),%rsi
+    ja fb_overflow
+    shlq $4,%rax
+    addq wvB(%rip),%rax
+    movq %rdi,(%rax)
+    movq $0xFFFF,%r9           /* replace the axis field in coords */
+    shlq %cl,%r9
+    notq %r9
+    movq %r12,%r10
+    andq %r9,%r10
+    movq %rdx,%r9
+    shlq %cl,%r9
+    orq %r9,%r10
+    movq %r10,8(%rax)
+    incq wnxt(%rip)
+fb_nd:
+    incl %ebx
+    jmp fb_dir
+fb_edone:
+    incq %r13
+    jmp fb_ent
+fb_wdone:
+    movq wnxt(%rip),%rax
+    testq %rax,%rax
+    jz fb_fail                 /* frontier died: unreachable */
+    movq %rax,wcur(%rip)
+    movq $0,wnxt(%rip)
+    movq wvA(%rip),%rax        /* swap wave buffers */
+    movq wvB(%rip),%rdx
+    movq %rdx,wvA(%rip)
+    movq %rax,wvB(%rip)
+    jmp fb_wave
+fb_found:
+    movzbl (%rdi),%eax         /* answer = player's came-from dir */
+    shrl $1,%eax
+    andl $7,%eax
+    movl %eax,%r14d
+    call sweep_marks
+    movl %r14d,%eax
+    jmp fb_ret
+fb_fail:
+    call sweep_marks
+    movl $-1,%eax
+fb_ret:
+    popq %r15
+    popq %r14
+    popq %r13
+    popq %r12
+    popq %rbp
+    popq %rbx
+    ret
+fb_overflow:
+    call sweep_marks           /* wave didn't fit: clean up, use DFS */
+fb_nobuf:
+    popq %r15
+    popq %r14
+    popq %r13
+    popq %r12
+    popq %rbp
+    popq %rbx
+    jmp find_opt
+
+/* win screen: reached by try_move when pcoord == ecoord.  Shows the move
+ * count (the score) and returns to the menu on any key. */
 win_scr:
     call clear_fb
     movl $16,curx(%rip)
@@ -2538,13 +3044,22 @@ s_ram:  .asciz "RAM FOR MAZE: "
 s_mib:  .asciz " MIB"
 s_vid:  .asciz "VIDEO: "
 s_maxn: .asciz "MAX N: "
-s_pr1:  .asciz "ENTER N (5-"
+s_pr1:  .asciz "ENTER N (2-"
 s_pr2:  .asciz "), MAZE = N^4 VOXELS"
 s_cur:  .asciz "> "
 s_epos: .asciz "ENTER A POSITIVE NUMBER"
-s_goal: .asciz "GOAL: FROM 1,1,1,1 TO GREEN EXIT"
+s_ty0:  .asciz "MAZE TYPE, N="
+s_ty1:  .asciz "1 = PERFECT: EXACTLY ONE PATH BETWEEN ANY TWO CELLS (DEFAULT)"
+s_ty2:  .asciz "2 = SPARSE: PERFECT + RANDOMLY REMOVED WALLS (EASIER, HAS LOOPS)"
+s_ty3:  .asciz "PRESS 1 / 2 (ENTER = PERFECT, ESC = BACK)"
+s_wl0:  .asciz "SPARSE MAZE, N="
+s_wl1:  .asciz "REMOVABLE WALLS: "
+s_wl2:  .asciz "HOW MANY TO REMOVE? (0 - MAX ABOVE, EMPTY = 0)"
+s_wl3:  .asciz "ENTER = GENERATE, ESC = BACK"
+s_rmw:  .asciz "REMOVING RANDOM WALLS..."
+s_goal: .asciz "GOAL: FROM 0,0,0,0 TO GREEN EXIT"
 s_l1:   .asciz "DOTS:OPEN YEL:YOU GRN:EXIT BLU:START"
-s_l2:   .asciz "ARROWS:XY W/S:Z A/K:W(4D) ESC:MENU X:RND H:OPT"
+s_l2:   .asciz "ARROWS:XY W/S:Z A/K:W(4D) ESC:MENU X:RND H:HINT B:BEST"
 s_l3:   .asciz "TAB:2D/3D 1-4:VIEW J/L I/M:ROT U/O:ZOOM R:RST"
 s_gen:  .asciz "GENERATING 4D MAZE, N="
 s_hmov: .asciz "MOVES:"
@@ -2580,6 +3095,13 @@ total:   .quad 0
 cells:   .quad 0
 moves:   .quad 0
 gdone:   .quad 0
+rmwalls: .quad 0
+maxrm:   .quad 0
+wvA:     .quad 0
+wvB:     .quad 0
+wvcap:   .quad 0
+wcur:    .quad 0
+wnxt:    .quad 0
 stride:  .quad 0,0,0,0
 sdtab:   .quad 0,0,0,0,0,0,0,0
 m_pa:    .quad 0
@@ -2654,7 +3176,7 @@ ecoord:  .long 0,0,0,0
 tvec:    .long 0,0,0,0
 hvec:    .long 0,0,0,0
 gcur:    .long 0,0,0,0
-svec:    .long 1,1,1,1
+svec:    .long 0,0,0,0
 vwin:    .long 15,15,15,15
 m_ax:    .long 0,0,0,0
 m_lo:    .long 0,0,0
@@ -2683,7 +3205,7 @@ vyaw:    .byte 21,21,21,21
 vpit:    .byte 242,242,242,242
 m_dsz:   .byte 0,0,0,0
 cand:    .byte 0,0,0,0,0,0,0,0
-inbuf:   .byte 0,0,0,0
+inbuf:   .byte 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
 tmpw:    .word 0
 numbuf:  .skip 24
 sintab:  .skip 512

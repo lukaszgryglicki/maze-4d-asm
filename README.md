@@ -14,9 +14,14 @@ forward / back ±z      W / S
 ata / kata     ±w      A / K     (the 4th dimension)
 ```
 
-You start at voxel `(1,1,1,1)`; you win by reaching the exit in the far corner
-(its exact coordinates are shown in the HUD). Score = number of successful moves
-(lower is better — bumping into walls is free).
+You start at voxel `(0,0,0,0)`; you win by reaching the exit at the opposite
+corner `(N−1,N−1,N−1,N−1)` (shown in the HUD). Score = number of successful
+moves (lower is better — bumping into walls is free). At boot you choose the
+maze size **N** (minimum 2), then the maze **type**: **perfect** (exactly one
+path between any two rooms — the default) or **sparse** (a perfect maze with a
+chosen number of walls knocked out, from 0 all the way to *every* wall voxel,
+which leaves a completely open N⁴ box and makes the 4D labyrinth much
+friendlier to actually solve by hand).
 
 ## How it works
 
@@ -51,17 +56,50 @@ You start at voxel `(1,1,1,1)`; you win by reaching the exit in the far corner
 
 ### Maze generation
 
-Perfect maze (every cell reachable, exactly one path between any two cells) via
+Perfect maze (every room reachable, exactly one path between any two rooms) via
 **iterative depth-first search with backtracking**:
 
-* Voxels with all-odd coordinates are *cells*; DFS carves the wall voxel between
-  neighboring cells in a random unvisited direction (xorshift32 RNG seeded from
-  `rdtsc` ⊕ PIT ⊕ RTC).
-* No recursion stack is needed: each visited cell temporarily stores the
+* Voxels with all-EVEN coordinates are *rooms* (`m = ⌈N/2⌉` per axis — there is
+  **no outer wall shell**, the grid edge itself is the boundary); DFS carves the
+  wall voxel between neighboring rooms in a random unvisited direction
+  (xorshift32 RNG seeded from `rdtsc` ⊕ PIT ⊕ RTC).
+* Start `(0,0,0,0)` is always a room. For **odd N** the exit corner
+  `(N−1,…)` is a room too; for **even N** it lies one voxel beyond the last
+  room layer, so after the DFS a 4-step staircase corridor is carved:
+  `(N−2,N−2,N−2,N−2) → +x → +y → +z → +w → (N−1,N−1,N−1,N−1)` — still a
+  perfect maze (a tree plus one attached dead-end path).
+* **Minimum N = 2**: 16 voxels, a single room at the origin plus that
+  staircase — start and exit differ in all four coordinates, so any win takes
+  ≥ 4 moves through ≥ 3 free intermediate voxels; the other **11 voxels are
+  walls** (the densest N=2 maze possible). N = 3 is the first properly random
+  maze (2⁴ = 16 rooms).
+* No recursion stack is needed: each visited room temporarily stores the
   direction it was entered from (bits 1-3) and is zeroed (opened) when the DFS
   unwinds — the maze itself is the stack, so N=500 works in O(1) extra memory.
 * A progress bar tracks carving (N ≥ 150 takes a while under TCG emulation —
   it's a 4D volume: N=300 is 8.1 GiB and ~493 million cells).
+
+### Sparse mazes (optional)
+
+A perfect 4D maze is *dense* — with up to 8 ways out of every room and a
+unique solution it is genuinely hard for humans. Choosing **2 = SPARSE** in
+the type menu asks for a number **R** of walls to remove and then, after the
+normal perfect carve, deletes **exactly R** randomly chosen wall voxels.
+**Every** still-full voxel is a candidate:
+
+```
+X = N⁴ − (2m⁴ − 1) − (4 if N even)        (m = rooms per axis = ⌈N/2⌉)
+```
+
+(N⁴ voxels minus m⁴ rooms, m⁴−1 carved passages, and the 4 exit-corridor
+voxels for even N; the menu shows X for your N — e.g. N=5 → 464, N=7 → 1890,
+N=9 → 5312). The pass streams over the whole volume once and removes each
+still-standing wall with probability `need/remaining` (sequential random
+sampling), which picks every R-subset with equal probability using no extra
+memory. R = 0 is a perfect maze; **R = X removes every wall, leaving a
+completely open N⁴ box** (shortest path = the Manhattan distance 4·(N−1)).
+Removed walls create loops — multiple routes to the exit exist, shortest
+paths get much shorter, and the 2D projections visibly open up.
 
 ### Rendering 4D
 
@@ -112,16 +150,29 @@ and every panel scrolls with you through big mazes.
 | U / O | zoom in / out (smaller / larger window, both modes) |
 | R | reset all views and zoom |
 | X | **random move** — one uniformly random step among the open directions |
-| H | **optimal move** — one step along the shortest path to the exit |
+| H | **hint move** — one converging step toward the exit (DFS path) |
+| B | **best move** — one step along a true shortest path (BFS) |
 | ESC | back to the size menu |
 
-Both X and H perform a real move and count toward your score. H finds the
-next step by depth-first search from the exit to you through the open voxels,
-using the maze bytes themselves as the DFS stack (the same zero-extra-memory
-trick generation uses) — since the maze is perfect, the discovered path is
-*the* unique shortest path. Holding H therefore auto-solves the maze; on huge
-mazes under TCG emulation one press can take a moment (it may explore the
-whole volume).
+X, H and B all perform a real move and count toward your score.
+
+**H (hint)** finds its step by a deterministic depth-first search from the
+exit to you through the open voxels, storing the came-from direction in the
+maze bytes themselves (the same zero-extra-memory trick generation uses) and
+sweeping the marks afterwards. Because the search is deterministic it always
+walks the same DFS spanning tree rooted at the exit, and each press moves you
+one step *up* that tree — so repeatedly pressing H **always converges** to
+the exit, from anywhere, even after you wander off. On a **perfect** maze the
+tree path is *the* unique path, so H is optimal there; on a **sparse** maze it
+is a valid route but possibly far from the shortest one.
+
+**B (best)** runs a full breadth-first search from the exit (wave queues live
+in the spare maze-region memory) and steps along a genuine shortest path —
+on any maze type, from any position. If the region has no spare room for the
+BFS queues, B transparently falls back to H's DFS. On a fully-opened sparse
+maze B walks the straight Manhattan route (e.g. N=5: exactly 16 moves).
+Holding H or B auto-solves the maze; on huge mazes under TCG emulation one
+press can take a moment (it may explore the whole volume).
 
 ## Building
 
@@ -192,10 +243,10 @@ available — 8 TB boxes welcome (16 TiB identity-map cap).
 
 | file | purpose |
 |------|---------|
-| `maze4d.S` | the whole OS + game, GAS AT&T syntax, ~2500 lines |
+| `maze4d.S` | the whole OS + game, GAS AT&T syntax, ~3100 lines |
 | `build.sh` | build → `maze4d.img` (Linux + FreeBSD) |
 | `run.sh` | convenience qemu launcher |
-| `poc/maze4d_poc.c` | tiny portable C proof-of-concept of the same maze algorithm (generation + BFS solvability check + text walker); build: `cc -O2 -o maze4d_poc poc/maze4d_poc.c` |
+| `poc/maze4d_poc.c` | tiny portable C proof-of-concept of the same maze algorithms (generation + sparse removal + BFS solvability/shortest-path checks + text walker); build: `cc -O2 -o maze4d_poc poc/maze4d_poc.c` |
 
 ## Implementation notes
 
@@ -205,14 +256,19 @@ available — 8 TB boxes welcome (16 TiB identity-map cap).
   palette is programmed manually via ports `3C8h/3C9h`.
 * Interrupts stay off forever; there is no IDT — any exception would
   triple-fault and reboot, which doubles as a very honest crash handler.
-* The player moves voxel-by-voxel: cells sit at odd coordinates, carved wall
-  voxels between them are walkable too, so crossing cell→cell costs 2 moves.
+* The player moves voxel-by-voxel: rooms sit at even coordinates with no outer
+  wall shell, carved wall voxels between them are walkable too, so crossing
+  room→room costs 2 moves.
 * Every drawing primitive clips to the framebuffer, and the layout adapts to
   the mode geometry (text scale is chosen from both width and height), so any
   resolution a real VBE BIOS throws at it — 320×200 up to 4K+ — stays playable.
 * Verified end-to-end in qemu: boot → menu → generation → all 8 move
   directions → per-view rotate/zoom → 2D/3D toggle → win screen → menu, at
-  N=5…300, at 3840×2160×16 and 1920×1200×32 (stdvga), 1600×1200×8 and
+  N=2…300, at 3840×2160×16 and 1920×1200×32 (stdvga), 1600×1200×8 and
   1152×864×8 (DAC palette path), 1280×1024×16 (cirrus) and 320×200×8
   (mode 13h), with the maze region placed above the 4 GiB boundary
-  (`-m 12288`).
+  (`-m 12288`). Sparse mazes and the assist keys are verified too: the wall
+  formula/count matches the C PoC, N=2 wins in exactly 4 moves (the 11-wall
+  staircase micro-maze), B wins a fully-open N=5 sparse maze in exactly
+  16 moves (the Manhattan optimum 4·(N−1)), H converges to the win on looped
+  mazes after arbitrary wandering, and B/H agree on perfect mazes.
